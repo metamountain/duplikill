@@ -14,6 +14,15 @@ Black and white, integer-scaled 8×8 C64 pixel font, 60 FPS spring-reverb overvi
 
 ---
 
+## Download & Install (Windows 10/11 64-bit)
+
+No Python, no manual dependencies required — `windows_czkawka_cli.exe` and the C64 pixel font are bundled inside:
+
+- **[⬇ Download `Duplikill-Setup.exe` (70 MB — 1-Click Windows Installer)](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Setup.exe)** — installs to `%LOCALAPPDATA%\Programs\Duplikill`, creates Start Menu & Desktop shortcuts, and launches Duplikill.
+- **[⬇ Download `Duplikill-Portable-win64.zip` (70 MB — Portable ZIP)](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Portable-win64.zip)** — unpack anywhere and run `Duplikill.exe`.
+
+---
+
 ## Screenshots & Workflow
 
 ### 1. Overview (Floating Net & Folder Clumps)
@@ -73,21 +82,16 @@ At least one image of a group always stays. Nothing is ever removed automaticall
 
 ---
 
-## Build & Run
+## Build from Source (Developers)
 
-Requires Python 3.14 and Windows 10/11.
+Requires Python 3.14 and Windows 10/11. `tools\build_exe.py` automatically downloads `windows_czkawka_cli.exe` 12.0.2 if not present, builds `dist\Duplikill\Duplikill.exe`, and packages both `dist\Duplikill-Portable-win64.zip` and `dist\Duplikill-Setup.exe`:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-```
-
-Download `windows_czkawka_cli.exe` 12.0.2 from the [Czkawka releases](https://github.com/qarmin/czkawka/releases) and place it into `tools\`.
-
-```powershell
-.venv\Scripts\python -I -m duplikill --dry-run      # run without touching files
+.venv\Scripts\python -I tools\build_exe.py          # builds Exe + Portable ZIP + Setup.exe
+.venv\Scripts\python -I -m duplikill --dry-run      # run from source without touching files
 .venv\Scripts\python -I -m pytest -q tests          # run test suite
-.venv\Scripts\python -I tools\build_exe.py          # build dist\Duplikill\Duplikill.exe
 ```
 
 ---
