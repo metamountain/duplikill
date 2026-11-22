@@ -11,7 +11,7 @@ Black and white, integer-scaled 8×8 C64 pixel font, keyboard and mouse driven. 
 ### 1. Overview (Floating Net & Folder Clumps)
 Few groups float as a live physics net of real thumbnails joined by folder lines; large archives switch automatically to organic pixel clumps (one square per photo, well above 30 fps). The similarity slider (`STRICT <######......> LOOSE`) re-queries the cache in a fraction of a second.
 
-![Overview](assets/overview.gif)
+![Overview](assets/overview.svg)
 
 ### 2. Review (Edge-to-Edge Compare with Central Seam Switches)
 Every group fills the screen edge to edge (`2 px` seam). All action switches cluster right around the **central seam `(W/2, H/2)`** so mouse travel stays minimal (~45 px) and photo centers (faces/subjects) are never covered:
