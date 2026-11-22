@@ -2,7 +2,13 @@
 
 Thin out a big photo archive, **blazingly fast**. Duplikill scans thousands of high-res photos in seconds, finds duplicate and similar series with zero false-positive chains, shows every group **edge-to-edge on one screen**, you cross out what should go, fire, next group.
 
-Powered under the hood by **[Czkawka](https://github.com/qarmin/czkawka) / [Krokiet](https://github.com/qarmin/czkawka/tree/master/krokiet)** (Rafał Mikrut's ferocious multi-threaded Rust hashing engine, sharing Krokiet's cache out of the box) paired with a vectorized NumPy/SQLite second-pass verifier (`~0.14 s` for 2,400 photos).
+### Why the Scan Engine Is So Fast
+
+- **Stage 1 — The [Czkawka](https://github.com/qarmin/czkawka) & [Krokiet](https://github.com/qarmin/czkawka/tree/master/krokiet) Rust Scan Engine (by Rafał Mikrut / [@qarmin](https://github.com/qarmin)):** All credit for the raw Stage-1 file & image-hashing engine goes to **Rafał Mikrut**, the inventor of **Czkawka** and its modern frontend **Krokiet**. His multi-threaded Rust scanner is an absolute beast — tearing through uncached folders at ~80–400 images/s and re-scanning cached archives (`> 1,000 images/s`) in a split second. Duplikill shares `%LOCALAPPDATA%\Qarmin\Czkawka\cache` directly with Krokiet, so any folder Krokiet has ever scanned opens almost instantaneously.
+- **Stage 2 — Vectorized 2-Pass Verification & Series Merger (`~0.14 s` for 400 groups / 2,400 photos):** Fast 8×8 hashes alone can group unrelated lookalikes or split long burst series. Duplikill decodes 1/8-scale JPEG drafts across all CPU cores, computes 24×24 greyscale structure correlation (`≥ 0.6`), 4×4 colour distance (`≤ 0.12`), 2D Laplacian sharpness, and EXIF capture timestamps (`DateTimeOriginal`), then runs a **two-pass vectorized agglomerative verifier**:
+  1. **Pass 1 (`refine`):** Splits out false lookalikes using average linkage with a strict floor (no transitive A→B→C chaining).
+  2. **Pass 2 (`merge`):** Re-unites burst series that Stage 1 split across multiple groups (`≤ 15 min`), backed by a versioned cluster-state cache and chunked SQLite signature storage (`~20 ms` to load 3,000 signatures).
+- **CUDA + Multi-Core Engine (`index.py` / `groups.py`):** Includes a hybrid CPU/GPU pipeline where multi-core processes decode 1/8-scale greyscale drafts ahead of the GPU while `torch.cuda` computes 64-bit DCT perceptual hashes, Laplacian sharpness, and 4096×4096 LUT-popcount Hamming distance matrices in batches of 256.
 
 Black and white, integer-scaled 8×8 C64 pixel font, 60 FPS spring-reverb overview, keyboard and mouse driven. Windows. By **metamountain**.
 
