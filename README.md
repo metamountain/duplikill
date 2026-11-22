@@ -18,7 +18,7 @@ Every group fills the screen edge to edge (`2 px` seam). All action switches clu
 - **2-image pairs:** Both `[☠]` instant-remove switches sit left and right of the vertical center seam directly above the `< i/N >` hub. Clicking one photo sets an `X`; clicking the other swaps the `X` in 1 click.
 - **Multi-image groups & bursts (e.g. 6 photos):** Each cell has `[ONLY] [☠]` at its inner seam corner. Click any subset of photos to cross them out (e.g. keep 3 of 6), or click `[ONLY]` / `[KEEP BEST]` to cross out all others in 1 click, then fire `[🗑 n X DEL]` right at the center.
 
-![Review](assets/review.gif)
+![Review](assets/review.svg)
 
 ### 3. Settings (`S`)
 Fixed-grid C64 menu with explanatory help lines under every setting, configurable mouse pan (`MIDDLE BUTTON` vs `RIGHT BUTTON`), live journal statistics, and JSON configuration (`%LOCALAPPDATA%\Duplikill\settings.json`).
