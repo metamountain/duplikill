@@ -2,7 +2,7 @@
 
 Wheel        = zoom all images together into the same spot (pixel exact from 100 %, no smoothing)
 Middle drag  = move the section in all images        Esc = back to the overview
-Left click   = toggle the delete cross               Del / Backspace / LOESCHEN button = delete them, next
+Left click   = toggle the delete cross               Del / Backspace / n X DEL button = delete them, next
 Hold right   = blink compare: every cell shows the next image of the group, same spot and zoom
 Tab / mouse side buttons = one image alone / flip to the next one
 Space / Right arrow = next group, Left arrow = previous
@@ -20,7 +20,10 @@ from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from . import pixelfont
-from .groups import Group
+from .groups import Group, pick_best
+from .index import human, register_heif
+
+register_heif()
 
 THUMB = 560
 WHITE = QColor(255, 255, 255)
@@ -29,14 +32,6 @@ BLACK_BG = QColor(0, 0, 0, 200)
 PER_GROUP, AT_END = "group", "end"       # when the delete command comes (setting)
 GAP = 2                                   # black seam between images, no other margin
 MAX_ZOOM = 64.0
-
-
-def human(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
-        n /= 1024
-    return str(n)
 
 
 def layout(n: int, w: float, h: float, aspect: float = 1.5, gap: float = GAP) -> tuple[int, int, float]:
@@ -79,7 +74,19 @@ def _read(path: str, max_pixels: int) -> QImage:
     if size.isValid() and size.width() * size.height() > max_pixels:
         f = (max_pixels / (size.width() * size.height())) ** 0.5
         r.setScaledSize(size * f)
-    return r.read()
+    img = r.read()
+    if not img.isNull():
+        return img
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im.convert("RGBA"))
+            if im.width * im.height > max_pixels:
+                f = (max_pixels / (im.width * im.height)) ** 0.5
+                im = im.resize((max(1, int(im.width * f)), max(1, int(im.height * f))), Image.BILINEAR)
+            return QImage(im.tobytes(), im.width, im.height, im.width * 4, QImage.Format_RGBA8888).copy()
+    except Exception:
+        return QImage()
 
 
 class Review(QWidget):
@@ -261,7 +268,15 @@ class Review(QWidget):
             sig = self._loaded.done
             n = len(self.group.photos) if self.group else 1
             budget = FULL_BUDGET // 4 // max(1, n)           # pixels per image (4 bytes each)
-            _POOL.submit(lambda: sig.emit(path, _read(path, budget)))
+
+            def _task():
+                decoded = _read(path, budget)
+                try:
+                    sig.emit(path, decoded)
+                except RuntimeError:
+                    pass
+
+            _POOL.submit(_task)
         return None if img is None or img.isNull() else img
 
     def _full_ready(self, path: str, img: QImage):
@@ -348,6 +363,7 @@ class Review(QWidget):
             return
         vis = self._visible()
         rects = cells(len(vis), self.width(), self.height())
+        cols_vis, _, _ = layout(len(vis), self.width(), self.height())
         self.rects = [QRectF() for _ in g.photos]
         m = self.marked()
         ts = self._ts()
@@ -357,7 +373,7 @@ class Review(QWidget):
             p = g.photos[j]
             thumb = self._thumb(p.path)
             iw, ih = self._dims(p, thumb)
-            s, src = self._view(cell, iw, ih)
+            s, _ = self._view(cell, iw, ih)
             qp.save()
             qp.setClipRect(cell)
             img_rect = QRectF(cell.center().x() - iw * s / 2 + (0.5 - self.center[0]) * iw * s,
@@ -377,11 +393,11 @@ class Review(QWidget):
             best_txt = "BEST  " if j == g.best else ""
             cap = pixelfont.render([f"{best_txt}{int(iw)}X{int(ih)}  {human(p.size)}{zoom_txt}", folder],
                                    ts, GREY if j in m else WHITE, BLACK_BG)
-            top_row = len(vis) > layout(len(vis), self.width(), self.height())[0] and cell.center().y() < self.height() / 2
+            top_row = len(vis) > cols_vis and cell.center().y() < self.height() / 2
             cap_y = int(cell.top()) if top_row else int(cell.bottom()) - cap.height()
             qp.drawImage(QPoint(int(cell.left()), cap_y), cap)
             qp.restore()
-        self._status(qp, g, ts, vis, rects)
+        self._status(qp, g, ts, vis)
         if self.swap == 0 and len(g.photos) > 1 and len(vis) > 1:
             self._draw_cell_switches(qp, g, ts, vis, rects)
 
@@ -462,24 +478,25 @@ class Review(QWidget):
         g = self.group
         j = next(k for k, p in enumerate(g.photos) if p.path == path)
         del g.photos[j]
-        m = self.marked()
-        self.marks[g.key] = {k - (k > j) for k in m if k != j}
+        g.best = pick_best(g) if g.photos else 0
+        m = {k - (k > j) for k in self.marked() if k != j}
+        if g.photos and len(m) >= len(g.photos):
+            m.discard(g.best if 0 <= g.best < len(g.photos) else 0)
+        self.marks[g.key] = m
         if self.solo is not None:
-            self.solo = min(self.solo, len(g.photos) - 1)
-        from .groups import pick_best
-        g.best = pick_best(g)
+            self.solo = min(self.solo, len(g.photos) - 1) if g.photos else None
         self.hover = -1
+        self.marks_changed.emit()
         self.update()
         return j
 
     def restore_photo(self, i: int, j: int, photo):
         g = self.groups[i]
         g.photos.insert(j, photo)
-        from .groups import pick_best
         g.best = pick_best(g)
         self.marks[g.key] = {k + (k >= j) for k in self.marks.get(g.key, set())}
 
-    def _status(self, qp: QPainter, g: Group, ts: int, vis: list[int], rects: list[QRectF]):
+    def _status(self, qp: QPainter, g: Group, ts: int, vis: list[int]):
         """Central Hub right at the seam intersection (W/2, H/2): status + nav on Row 1, action on Row 2."""
         W, H = self.width(), self.height()
         hub_cx, hub_cy, _, _ = self._hub_anchor(len(vis), W, H)
@@ -648,8 +665,11 @@ class Review(QWidget):
         g = self.group
         if g is None or not self.rects:
             return
-        cell_idx = self.hover if self.hover >= 0 and not self.rects[self.hover].isNull() else 0
-        if self.rects[cell_idx].isNull():
+        cell_idx = self.hover if 0 <= self.hover < len(self.rects) and not self.rects[self.hover].isNull() else (
+            self.solo if self.solo is not None and 0 <= self.solo < len(self.rects) else
+            next((k for k, r in enumerate(self.rects) if not r.isNull()), -1)
+        )
+        if cell_idx < 0 or self.rects[cell_idx].isNull():
             return
         p = g.photos[cell_idx]
         iw, ih = self._dims(p, self._thumb(p.path))

@@ -31,11 +31,12 @@ def pack_folder(sizes: list[int], seed: int = 0) -> tuple[list[tuple[int, int, i
     total = sum((_grid(k)[0] + 1) * (_grid(k)[1] + 1) for k in sizes)
     cand = _spiral(total * 3, seed)
     rad = int(np.abs(cand).max()) + 12
+    cand_pts = cand.tolist()
     occ = np.zeros((2 * rad + 1, 2 * rad + 1), bool)
     out = [None] * len(sizes)
     for gi in sorted(range(len(sizes)), key=lambda i: -sizes[i]):
         c, r = _grid(sizes[gi])
-        for x, y in cand:
+        for x, y in cand_pts:
             x0, y0 = x - c // 2 + rad, y - r // 2 + rad
             if x0 < 1 or y0 < 1 or x0 + c + 1 >= occ.shape[1] or y0 + r + 1 >= occ.shape[0]:
                 continue
@@ -61,7 +62,6 @@ class Clumps:
         self.label_h = 0
         self.label_w = [0] * n_folders
         self.centre = np.zeros((n_folders, 2), float)
-        self.rects: list[tuple[float, float, int, int]] = [(0.0, 0.0, 0, 0)] * len(groups)
 
         n_g = len(groups)
         self.group_clump = np.array(folder_of, int) if n_g else np.zeros(0, int)
@@ -102,8 +102,12 @@ class Clumps:
     def layout(self, w: int, h: int, hole: tuple[int, int], label_h: int, label_w: list[int] | None = None):
         """Largest square pitch for which all clumps fit around the middle."""
         self.label_w = label_w or [0] * len(self.members)
+        spans = [(k, self.packs[k][1][2] - self.packs[k][1][0], self.packs[k][1][3] - self.packs[k][1][1])
+                 for k, m in enumerate(self.members) if m]
         for u in range(24, 2, -1):
-            if self._place(w, h, hole, label_h, u):
+            needed = sum(max(sw * u, self.label_w[k]) * (sh * u + label_h) for k, sw, sh in spans)
+            avail = max(0, (w - 4 * u) * (h - 4 * u - 32) - (hole[0] + 4 * u) * (hole[1] + 4 * u))
+            if needed <= avail and self._place(w, h, hole, label_h, u):
                 self.u = u
                 self._update_base()
                 return

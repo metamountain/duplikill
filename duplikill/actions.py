@@ -8,6 +8,7 @@ import time
 
 from .index import data_dir
 
+
 def sidecars(path: str) -> list[str]:
     stem, _ = os.path.splitext(path)
     out = []
@@ -48,17 +49,28 @@ class Mover:
 
     def move(self, paths: list[str], group_key: str) -> list[tuple[str, str]]:
         moved = []
+        total_bytes = 0
         for p in paths:
             for src in [p, *sidecars(p)]:
                 dst = target_for(src, self.target_root, self.mode, self.scan_root)
                 if os.path.exists(dst):
                     base, ext = os.path.splitext(dst)
-                    dst = f"{base}_{int(time.time())}{ext}"
+                    stamp = int(time.time())
+                    dst = f"{base}_{stamp}{ext}"
+                    k = 1
+                    while os.path.exists(dst):
+                        dst = f"{base}_{stamp}_{k}{ext}"
+                        k += 1
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(src, dst)
                 moved.append((src, dst))
+                try:
+                    total_bytes += os.path.getsize(dst)
+                except OSError:
+                    pass
         with open(self.journal, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"at": time.time(), "group": group_key, "moved": moved}, ensure_ascii=False) + "\n")
+            fh.write(json.dumps({"at": time.time(), "group": group_key, "moved": moved, "bytes": total_bytes},
+                                ensure_ascii=False) + "\n")
         return moved
 
     def undo_last(self) -> dict | None:
@@ -84,12 +96,19 @@ class Mover:
         """(files moved, bytes moved) over the whole journal."""
         n = b = 0
         if os.path.exists(self.journal):
-            for line in open(self.journal, encoding="utf-8"):
-                if line.strip():
-                    for src, dst in json.loads(line)["moved"]:
-                        n += 1
-                        try:
-                            b += os.path.getsize(dst)
-                        except OSError:
-                            pass
+            with open(self.journal, encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    moved = entry["moved"]
+                    n += len(moved)
+                    if "bytes" in entry:
+                        b += int(entry["bytes"])
+                    else:
+                        for _, dst in moved:
+                            try:
+                                b += os.path.getsize(dst)
+                            except OSError:
+                                pass
         return n, b

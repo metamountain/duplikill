@@ -9,7 +9,9 @@ from collections import OrderedDict
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QImage
 
-from .groups import Group
+from .index import register_heif
+
+register_heif()
 
 THUMB = 560          # long edge of preloaded thumbnails
 CACHE_MAX = 12000    # thumbnails kept in memory (JPEG-compressed, ~40 KB each)
@@ -22,12 +24,6 @@ class _Load(QRunnable):
 
     def run(self):
         from PIL import Image, ImageOps
-        try:
-            import pillow_heif
-            pillow_heif.register_heif_opener()
-        except Exception:
-            pass
-        data = None
         try:
             with Image.open(self.path) as img:
                 img.draft("RGB", (self.size, self.size))
@@ -81,9 +77,3 @@ class Thumbs(QObject):
             self.ready.emit(path)
         except RuntimeError:          # window already closed while a thumbnail was loading
             pass
-
-    def preload(self, groups: list[Group], start: int):
-        """Everything from the current group on, nearest first."""
-        for gi, g in enumerate(groups[start:] + groups[:start]):
-            for p in g.photos:
-                self.request(p.path, THUMB, priority=max(0, 5 - gi))

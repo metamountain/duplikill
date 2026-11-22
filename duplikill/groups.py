@@ -15,7 +15,7 @@ from .index import Cache, Photo, Progress
 MODES = {"exact": "Exact duplicates", "similar": "Similar images", "burst": "Bursts"}
 # similar: max differing bits of 64; burst: max seconds between two shots
 STRICTNESS = {
-    "similar": {"Sehr streng": 3, "Streng": 6, "Normal": 10, "Locker": 14},
+    "similar": {"Very strict": 3, "Strict": 6, "Normal": 10, "Loose": 14},
     "burst": {"1 s": 1, "2 s": 2, "3 s": 3, "5 s": 5, "10 s": 10},
 }
 MAX_GROUP = 60  # larger similar groups are split again with a stricter threshold
@@ -29,7 +29,7 @@ class Group:
     key: str = field(default="")
 
     def __post_init__(self):
-        self.photos.sort(key=lambda p: (p.taken or p.mtime, p.path))
+        self.photos.sort(key=lambda p: (p.taken if p.taken is not None else p.mtime, p.path))
         self.key = self.kind + ":" + hashlib.blake2b("\n".join(sorted(p.path for p in self.photos)).encode(),
                                                        digest_size=12).hexdigest()
         self.best = pick_best(self)
@@ -78,7 +78,7 @@ def exact(photos: list[Photo], cache: Cache, progress: Progress) -> list[Group]:
             if b:
                 cache.set_blake(p.path, b)
             if i % 100 == 0:
-                progress(i, len(todo), "Dateiinhalt vergleichen")
+                progress(i, len(todo), "comparing file contents")
                 cache.commit()
     cache.commit()
     by_hash = defaultdict(list)

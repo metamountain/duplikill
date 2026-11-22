@@ -13,51 +13,49 @@ from __future__ import annotations
 
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 
 import numpy as np
 
 from .groups import Group
+from .index import data_dir, exif_info, register_heif, sharpness
+
+register_heif()
 
 MIN_CORR = 0.6
 MAX_CDIST = 0.12
 COPY_CORR = 0.9
 SAME_DAY = 24 * 3600
+LOOSE_CORR = 0.4     # no pair inside a group may fall below this ...
+LOOSE_CDIST = 0.2    # ... or above this
+SERIES_GAP = 15 * 60          # groups whose pictures were taken this close may be one series
+_DB_CHUNK = 900
 
 
 class Sig:
-    __slots__ = ("grey", "colour", "taken")
+    __slots__ = ("grey", "colour", "taken", "sharp")
 
-    def __init__(self, grey, colour, taken):
-        self.grey, self.colour, self.taken = grey, colour, taken
-
-
-def _taken(img) -> float | None:
-    try:
-        ex = img.getexif()
-        raw = ex.get_ifd(0x8769).get(36867) or ex.get(306)          # DateTimeOriginal / DateTime
-        if raw:
-            return datetime.strptime(str(raw).strip()[:19], "%Y:%m:%d %H:%M:%S").timestamp()
-    except Exception:
-        pass
-    return None
+    def __init__(self, grey, colour, taken, sharp: float = 0.0):
+        self.grey, self.colour, self.taken, self.sharp = grey, colour, taken, float(sharp or 0.0)
 
 
 def signature(path: str) -> Sig | None:
     from PIL import Image, ImageOps
     try:
         with Image.open(path) as im:
-            taken = _taken(im)
+            _, _, taken, _ = exif_info(im)
             im.draft("RGB", (256, 256))
             im = ImageOps.exif_transpose(im.convert("RGB"))
             small = np.asarray(im.resize((24, 24), Image.BILINEAR), np.float32) / 255
+            im.thumbnail((256, 256))
+            sharp = sharpness(np.asarray(im.convert("L")))
     except Exception:
         return None
     g = small.mean(2).ravel()
     g = (g - g.mean()) / (g.std() + 1e-6)
     colour = small.reshape(4, 6, 4, 6, 3).mean((1, 3)).ravel()
-    return Sig(g, colour, taken)
+    return Sig(g, colour, taken, sharp)
 
 
 def similar(a: Sig, b: Sig) -> bool:
@@ -72,48 +70,68 @@ def similar(a: Sig, b: Sig) -> bool:
 
 
 class SigCache:
-    """Signatures by (path, size, mtime): in memory while the program runs (slider is quick) and in a small
+    r"""Signatures by (path, size, mtime): in memory while the program runs (slider is quick) and in a small
     SQLite file under %LOCALAPPDATA%\Duplikill, so the next run over the same folder is quick too."""
 
     def __init__(self, db_path: str | None = None):
         self.d: dict[tuple, Sig | None] = {}
         self.lock = threading.Lock()
-        self.db_path = db_path if db_path is not None else _default_db()
+        self.db_path = db_path if db_path is not None else os.path.join(data_dir(), "signatures.sqlite")
+        self._schema_ready = False
 
     def _db(self):
         import sqlite3
         con = sqlite3.connect(self.db_path)
-        con.execute("CREATE TABLE IF NOT EXISTS sig (path TEXT, size INTEGER, mtime REAL, grey BLOB, colour BLOB,"
-                    " taken REAL, PRIMARY KEY (path, size, mtime))")
+        if not self._schema_ready:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS sig (path TEXT, size INTEGER, mtime REAL, grey BLOB, colour BLOB,"
+                " taken REAL, sharp REAL DEFAULT 0.0, PRIMARY KEY (path, size, mtime))"
+            )
+            cols = {r[1] for r in con.execute("PRAGMA table_info(sig)")}
+            if "sharp" not in cols:
+                con.execute("ALTER TABLE sig ADD COLUMN sharp REAL DEFAULT 0.0")
+            con.commit()
+            self._schema_ready = True
         return con
 
     def _load(self, keys: list[tuple]) -> None:
         if not self.db_path or not keys:
             return
+        wanted = set(keys)
+        paths = list({k[0] for k in keys})
         try:
-            con = self._db()
-            for k in keys:
-                row = con.execute("SELECT grey, colour, taken FROM sig WHERE path=? AND size=? AND mtime=?", k).fetchone()
-                if row:
-                    self.d[k] = None if row[0] is None else Sig(np.frombuffer(row[0], np.float32),
-                                                                np.frombuffer(row[1], np.float32), row[2])
-            con.close()
+            with closing(self._db()) as con, con:
+                for i in range(0, len(paths), _DB_CHUNK):
+                    chunk = paths[i:i + _DB_CHUNK]
+                    q = ",".join("?" * len(chunk))
+                    sql = f"SELECT path, size, mtime, grey, colour, taken, sharp FROM sig WHERE path IN ({q})"
+                    for p, sz, mt, grey, colour, taken, sharp in con.execute(sql, chunk):
+                        k = (p, sz, mt)
+                        if k in wanted:
+                            self.d[k] = None if grey is None else Sig(
+                                np.frombuffer(grey, np.float32),
+                                np.frombuffer(colour, np.float32),
+                                taken,
+                                sharp or 0.0,
+                            )
         except Exception:
-            pass
+            self._schema_ready = False
 
     def _save(self, items: list[tuple[tuple, Sig | None]]) -> None:
         if not self.db_path or not items:
             return
         try:
-            con = self._db()
-            con.executemany("INSERT OR REPLACE INTO sig VALUES (?,?,?,?,?,?)",
-                            [(*k, None if s is None else s.grey.astype(np.float32).tobytes(),
-                              None if s is None else s.colour.astype(np.float32).tobytes(),
-                              None if s is None else s.taken) for k, s in items])
-            con.commit()
-            con.close()
+            with closing(self._db()) as con, con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO sig VALUES (?,?,?,?,?,?,?)",
+                    [(*k,
+                      None if s is None else s.grey.astype(np.float32).tobytes(),
+                      None if s is None else s.colour.astype(np.float32).tobytes(),
+                      None if s is None else s.taken,
+                      None if s is None else s.sharp) for k, s in items],
+                )
         except Exception:
-            pass
+            self._schema_ready = False
 
     def get_many(self, photos, stop: threading.Event | None = None, workers: int | None = None) -> dict[str, Sig | None]:
         keys = {p.path: (p.path, p.size, p.mtime) for p in photos}
@@ -125,99 +143,161 @@ class SigCache:
                 out[path] = self.d[k]
             else:
                 todo.append((k, path))
-        if todo:
+        if todo and not (stop is not None and stop.is_set()):
             new = []
-            with ThreadPoolExecutor(max_workers=workers or os.cpu_count() or 8) as ex:
-                for (k, path), sig in zip(todo, ex.map(lambda t: signature(t[1]), todo)):
+            ex = ThreadPoolExecutor(max_workers=workers or os.cpu_count() or 8)
+            try:
+                futs = {
+                    ex.submit(
+                        lambda p: None if (stop is not None and stop.is_set()) else signature(p),
+                        path,
+                    ): (k, path)
+                    for k, path in todo
+                }
+                for fut in as_completed(futs):
                     if stop is not None and stop.is_set():
+                        for f in futs:
+                            f.cancel()
                         break
+                    k, path = futs[fut]
+                    sig = fut.result()
                     with self.lock:
                         self.d[k] = sig
                     out[path] = sig
                     new.append((k, sig))
-            with self.lock:
-                self._save(new)
+            finally:
+                ex.shutdown(wait=stop is None or not stop.is_set(), cancel_futures=True)
+            if new:
+                with self.lock:
+                    self._save(new)
         return out
-
-
-def _default_db() -> str:
-    base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Duplikill")
-    os.makedirs(base, exist_ok=True)
-    return os.path.join(base, "signatures.sqlite")
-
-
-def close(a: Sig, b: Sig) -> bool:
-    """Same scene, ignoring the date: used so that every member of a group fits every other one."""
-    if a is None or b is None:
-        return False
-    return float((a.grey * b.grey).mean()) >= MIN_CORR and float(np.abs(a.colour - b.colour).mean()) <= MAX_CDIST
-
-
-LOOSE_CORR = 0.4     # no pair inside a group may fall below this ...
-LOOSE_CDIST = 0.2    # ... or above this
 
 
 def _fits(x: list, y: list, sigs) -> bool:
     """Average linkage with a floor, so no chains: on average every pair fits closely, no single pair is far
     off, and at least one pair is a real match (date included)."""
-    pairs = [(sigs.get(a.path), sigs.get(b.path)) for a in x for b in y]
-    if any(a is None or b is None for a, b in pairs):
+    if not x or not y:
         return False
-    corr = [float((a.grey * b.grey).mean()) for a, b in pairs]
-    cd = [float(np.abs(a.colour - b.colour).mean()) for a, b in pairs]
-    if min(corr) < LOOSE_CORR or max(cd) > LOOSE_CDIST:
+    sx = [sigs.get(a.path) for a in x]
+    sy = [sigs.get(b.path) for b in y]
+    if any(s is None for s in sx) or any(s is None for s in sy):
         return False
-    if sum(corr) / len(corr) < MIN_CORR or sum(cd) / len(cd) > MAX_CDIST:
+    a_grey = np.stack([s.grey for s in sx])
+    b_grey = np.stack([s.grey for s in sy])
+    corr = (a_grey @ b_grey.T) / a_grey.shape[1]
+    if float(corr.min()) < LOOSE_CORR or float(corr.mean()) < MIN_CORR:
         return False
-    return any(similar(a, b) for a, b in pairs)
+    a_col = np.stack([s.colour for s in sx])
+    b_col = np.stack([s.colour for s in sy])
+    cd = np.abs(a_col[:, None, :] - b_col[None, :, :]).mean(axis=2)
+    if float(cd.max()) > LOOSE_CDIST or float(cd.mean()) > MAX_CDIST:
+        return False
+    if bool(((corr >= COPY_CORR) & (cd <= MAX_CDIST)).any()):
+        return True
+    base = (corr >= MIN_CORR) & (cd <= MAX_CDIST)
+    if not bool(base.any()):
+        return False
+    ta = np.array([np.nan if s.taken is None else s.taken for s in sx], dtype=np.float64)
+    tb = np.array([np.nan if s.taken is None else s.taken for s in sy], dtype=np.float64)
+    both_t = np.isfinite(ta)[:, None] & np.isfinite(tb)[None, :]
+    date_ok = np.where(both_t, np.abs(ta[:, None] - tb[None, :]) <= SAME_DAY, corr >= 0.75)
+    return bool((base & date_ok).any())
 
 
 def _agglomerate(clusters: list[list], sigs, candidates) -> list[list]:
     """Joins clusters along candidate pairs (i, j) as long as _fits holds; best pairs first."""
     alive = {i: c for i, c in enumerate(clusters)}
     owner = list(range(len(clusters)))
+    ver = [0] * len(clusters)
+    rejected: set[tuple[int, int, int, int]] = set()
 
     def find(i):
         while owner[i] != i:
+            owner[i] = owner[owner[i]]
             i = owner[i]
         return i
 
     for i, j in candidates:
         a, b = find(i), find(j)
-        if a != b and _fits(alive[a], alive[b], sigs):
+        if a == b:
+            continue
+        u, v = (a, b) if a < b else (b, a)
+        state = (u, ver[u], v, ver[v])
+        if state in rejected:
+            continue
+        if _fits(alive[a], alive[b], sigs):
             alive[a] = alive[a] + alive.pop(b)
             owner[b] = a
+            ver[a] += 1
+        else:
+            rejected.add(state)
     return list(alive.values())
+
+
+def _apply_sigs(photos: list, sigs: dict[str, Sig | None]) -> None:
+    for p in photos:
+        s = sigs.get(p.path)
+        if s is not None:
+            if s.taken is not None and p.taken is None:
+                p.taken = s.taken
+            if s.sharp and not p.sharp:
+                p.sharp = s.sharp
+
+
+def _group_matrices(sigs_list: list[Sig]):
+    greys = np.stack([s.grey for s in sigs_list])
+    colours = np.stack([s.colour for s in sigs_list])
+    k = len(sigs_list)
+    corr = (greys @ greys.T) / greys.shape[1]
+    cd = np.empty((k, k), dtype=np.float32)
+    for s in range(0, k, 128):
+        cd[s:s + 128] = np.abs(colours[s:s + 128, None, :] - colours[None, :, :]).mean(axis=2)
+    takens = np.array([np.nan if s.taken is None else s.taken for s in sigs_list], dtype=np.float64)
+    both_t = np.isfinite(takens)[:, None] & np.isfinite(takens)[None, :]
+    same_day = np.abs(takens[:, None] - takens[None, :]) <= SAME_DAY
+    sim = ((corr >= COPY_CORR) & (cd <= MAX_CDIST)) | (
+        (corr >= MIN_CORR) & (cd <= MAX_CDIST) & np.where(both_t, same_day, corr >= 0.75)
+    )
+    return corr, cd, sim
 
 
 def refine(groups: list[Group], cache: SigCache | None = None, stop: threading.Event | None = None) -> list[Group]:
     cache = cache or SigCache()
     sigs = cache.get_many([p for g in groups for p in g.photos], stop)
+    if stop is not None and stop.is_set():
+        return []
     out = []
     for g in groups:
         ps = g.photos
-        cand = []
-        for i in range(len(ps)):
-            for j in range(i + 1, len(ps)):
-                a, b = sigs.get(ps[i].path), sigs.get(ps[j].path)
-                if a is not None and b is not None and similar(a, b):
-                    cand.append((-float((a.grey * b.grey).mean()), i, j))
-        cand.sort()
-        for members in _agglomerate([[p] for p in ps], sigs, [(i, j) for _, i, j in cand]):
-            if len(members) > 1:
-                out.append(Group(g.kind, members))
-    return merge(out, cache)
+        _apply_sigs(ps, sigs)
+        valid = [(p, sigs[p.path]) for p in ps if sigs.get(p.path) is not None]
+        if len(valid) < 2:
+            continue
+        v_photos = [p for p, _ in valid]
+        corr, _, sim = _group_matrices([s for _, s in valid])
+        ii, jj = np.nonzero(np.triu(sim, 1))
+        if not len(ii):
+            continue
+        order = np.argsort(-corr[ii, jj])
+        pairs = [(int(ii[idx]), int(jj[idx])) for idx in order.tolist()]
+        for cluster in _agglomerate([[p] for p in v_photos], sigs, pairs):
+            if len(cluster) > 1:
+                out.append(Group(g.kind, cluster))
+    return merge(out, cache, sigs)
 
 
-SERIES_GAP = 15 * 60          # groups whose pictures were taken this close may be one series
-
-
-def merge(groups: list[Group], cache: SigCache | None = None) -> list[Group]:
+def merge(groups: list[Group], cache: SigCache | None = None,
+          _sigs: dict[str, Sig | None] | None = None) -> list[Group]:
     """Joins groups that are really one series (Czkawka splits long series), without chaining."""
     if len(groups) < 2:
         return groups
-    cache = cache or SigCache()
-    sigs = cache.get_many([p for g in groups for p in g.photos])
+    if _sigs is None:
+        cache = cache or SigCache()
+        sigs = cache.get_many([p for g in groups for p in g.photos])
+        for g in groups:
+            _apply_sigs(g.photos, sigs)
+    else:
+        sigs = _sigs
     items = sorted(((sigs[p.path].taken, gi) for gi, g in enumerate(groups) for p in g.photos
                     if sigs.get(p.path) is not None and sigs[p.path].taken is not None))
     cand = []

@@ -9,9 +9,11 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import weakref
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Callable, Iterable
 
 import numpy as np
@@ -24,10 +26,30 @@ SHARP_SIZE = 256        # long edge used to measure sharpness
 Progress = Callable[[int, int, str], None]
 
 
+@lru_cache(maxsize=1)
+def register_heif() -> None:
+    try:
+        import pillow_heif  # noqa: F401
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+
+register_heif()
+
+
 def data_dir() -> str:
     d = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Duplikill")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return str(n)
 
 
 @dataclass
@@ -57,11 +79,21 @@ class Photo:
 class Cache:
     def __init__(self, path: str | None = None):
         self.db = sqlite3.connect(path or os.path.join(data_dir(), "index.sqlite"), check_same_thread=False)
+        self._fin = weakref.finalize(self, self.db.close)
         self.db.execute(
             "create table if not exists files (path text primary key, size int, mtime real, width int,"
             " height int, taken real, phash int, sharp real, blake text)")
         self.db.execute("create table if not exists done (key text primary key, at real)")
         self.db.commit()
+
+    def close(self) -> None:
+        self._fin()
+
+    def __enter__(self) -> "Cache":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def get_all(self) -> dict[str, Photo]:
         out = {}
@@ -124,9 +156,21 @@ def phash_from_small(gray32: np.ndarray) -> int:
 
 
 def sharpness(gray: np.ndarray) -> float:
+    if gray.shape[0] < 3 or gray.shape[1] < 3:
+        return 0.0
     g = gray.astype(np.float32)
     lap = -4 * g[1:-1, 1:-1] + g[:-2, 1:-1] + g[2:, 1:-1] + g[1:-1, :-2] + g[1:-1, 2:]
     return float(lap.var())
+
+
+def exif_taken(ex) -> float | None:
+    try:
+        raw = ex.get_ifd(0x8769).get(36867) or ex.get(306)
+        if raw:
+            return datetime.strptime(str(raw).strip()[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+    except Exception:
+        pass
+    return None
 
 
 def exif_info(img) -> tuple[int, int, float | None, int]:
@@ -136,9 +180,7 @@ def exif_info(img) -> tuple[int, int, float | None, int]:
     try:
         ex = img.getexif()
         orient = int(ex.get(0x0112, 1) or 1)
-        raw = ex.get_ifd(0x8769).get(36867) or ex.get(306)
-        if raw:
-            taken = datetime.strptime(str(raw).strip()[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+        taken = exif_taken(ex)
     except Exception:
         pass
     if orient in (5, 6, 7, 8):
@@ -148,22 +190,23 @@ def exif_info(img) -> tuple[int, int, float | None, int]:
 
 # ---------------------------------------------------------------- CPU engine
 
-def _analyze_cpu(path: str) -> tuple | None:
+def _open_gray(path: str):
     from PIL import Image, ImageOps
+    with Image.open(path) as img:
+        w, h, taken, _ = exif_info(img)
+        img.draft("L", (SHARP_SIZE, SHARP_SIZE))
+        img = ImageOps.exif_transpose(img.convert("L"))
+        img.thumbnail((SHARP_SIZE, SHARP_SIZE))
+        return w, h, taken, img
+
+
+def _analyze_cpu(path: str) -> tuple | None:
+    from PIL import Image
     try:
-        import pillow_heif  # noqa: F401
-        pillow_heif.register_heif_opener()
-    except Exception:
-        pass
-    try:
-        with Image.open(path) as img:
-            w, h, taken, _ = exif_info(img)
-            img.draft("L", (SHARP_SIZE, SHARP_SIZE))
-            img = ImageOps.exif_transpose(img.convert("L"))
-            img.thumbnail((SHARP_SIZE, SHARP_SIZE))
-            g = np.asarray(img)
-            small = np.asarray(img.resize((HASH_SIZE, HASH_SIZE), Image.BILINEAR))
-            return (path, w, h, taken, phash_from_small(small), sharpness(g))
+        w, h, taken, img = _open_gray(path)
+        g = np.asarray(img)
+        small = np.asarray(img.resize((HASH_SIZE, HASH_SIZE), Image.BILINEAR))
+        return (path, w, h, taken, phash_from_small(small), sharpness(g))
     except Exception:
         return None
 
@@ -173,7 +216,7 @@ class CpuEngine:
 
     def __init__(self, workers: int | None = None):
         self.workers = workers or max(2, (os.cpu_count() or 4) - 1)
-        self.name = f"CPU · {self.workers} Kerne"
+        self.name = f"CPU · {self.workers} cores"
 
     def analyze(self, paths: list[str], progress: Progress, offset: int = 0, total: int = 0) -> list[tuple]:
         out = []
@@ -190,22 +233,12 @@ class CpuEngine:
 
 def _decode_small(path: str) -> tuple | None:
     """CPU part for the GPU engine: EXIF + a 256 px grayscale array (JPEG draft mode = 1/8 decode)."""
-    from PIL import Image, ImageOps
     try:
-        import pillow_heif
-        pillow_heif.register_heif_opener()
-    except Exception:
-        pass
-    try:
-        with Image.open(path) as img:
-            w, h, taken, _ = exif_info(img)
-            img.draft("L", (SHARP_SIZE, SHARP_SIZE))
-            img = ImageOps.exif_transpose(img.convert("L"))
-            img.thumbnail((SHARP_SIZE, SHARP_SIZE))
-            g = np.zeros((SHARP_SIZE, SHARP_SIZE), np.uint8)
-            a = np.asarray(img)
-            g[:a.shape[0], :a.shape[1]] = a
-            return (path, w, h, taken, g, a.shape[0], a.shape[1])
+        w, h, taken, img = _open_gray(path)
+        g = np.zeros((SHARP_SIZE, SHARP_SIZE), np.uint8)
+        a = np.asarray(img)
+        g[:a.shape[0], :a.shape[1]] = a
+        return (path, w, h, taken, g, a.shape[0], a.shape[1])
     except Exception:
         return None
 
@@ -231,7 +264,6 @@ class CudaEngine:
         total = total or len(paths)
         out, buf, done = [], [], 0
         with ProcessPoolExecutor(self.workers) as ex:
-            # imap-style: results stream in order while workers keep decoding ahead
             for r in ex.map(_decode_small, paths, chunksize=8):
                 done += 1
                 if r:
@@ -252,7 +284,6 @@ class CudaEngine:
         res = []
         hs = torch.tensor([it[5] for it in items], device=self.dev)
         ws = torch.tensor([it[6] for it in items], device=self.dev)
-        # sharpness: Laplacian variance over the valid area of each image
         lap = (-4 * x[:, 1:-1, 1:-1] + x[:, :-2, 1:-1] + x[:, 2:, 1:-1] + x[:, 1:-1, :-2] + x[:, 1:-1, 2:])
         yy = torch.arange(1, SHARP_SIZE - 1, device=self.dev)[None, :, None]
         xx = torch.arange(1, SHARP_SIZE - 1, device=self.dev)[None, None, :]
@@ -260,7 +291,6 @@ class CudaEngine:
         n = mask.sum((1, 2)).clamp(min=1)
         mean = (lap * mask).sum((1, 2)) / n
         var = ((lap - mean[:, None, None]) ** 2 * mask).sum((1, 2)) / n
-        # pHash: resize each valid area to 32x32, DCT, compare low frequencies with their median
         smalls = []
         for i, it in enumerate(items):
             h, w = it[5], it[6]
@@ -274,7 +304,6 @@ class CudaEngine:
         for i, it in enumerate(items):
             res.append((it[0], it[1], it[2], it[3], int(packed[i]), float(var[i])))
         return res
-
 
 
 def make_engine(prefer_cuda: bool = True):

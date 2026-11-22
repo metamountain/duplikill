@@ -95,7 +95,7 @@ def render_bits(bm: np.ndarray, scale: int, fg=QColor(255, 255, 255), bg=QColor(
     rgba = np.empty((h, w, 4), np.uint8)
     rgba[:] = (bg.red(), bg.green(), bg.blue(), bg.alpha())
     rgba[bm] = (fg.red(), fg.green(), fg.blue(), fg.alpha())
-    return QImage(rgba.tobytes(), w, h, w * 4, QImage.Format_RGBA8888).copy()
+    return QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
 
 
 def render(lines: list[str], scale: int, fg=QColor(255, 255, 255), bg=QColor(0, 0, 0, 0)) -> QImage:

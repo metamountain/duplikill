@@ -29,7 +29,7 @@ def lib(tmp_path, monkeypatch):
     _img(root / "a" / "x2.jpg", 1, blur=2, exif_time="2020:05:01 10:00:01")  # similar + burst, blurrier
     _img(root / "a" / "y.jpg", 99, exif_time="2020:05:01 12:00:00")          # unrelated
     Image.open(root / "a" / "x1.jpg").resize((400, 300)).save(root / "a" / "x1_small.jpg")  # similar, smaller
-    open(root / "a" / "x2.xmp", "w").write("<x/>")
+    (root / "a" / "x2.xmp").write_text("<x/>")
     return root
 
 

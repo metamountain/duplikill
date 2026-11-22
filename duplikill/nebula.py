@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QWidget
 from . import pixelfont
 from .clumps import Clumps
 from .groups import Group
+from .index import human
 
 THUMB_SIZE = 192      # loaded thumbnail size (long edge)
 ABSTRACT_GROUPS = 80   # more groups (or images) than this: pixel blocks instead of thumbnails,
@@ -33,14 +34,6 @@ for _a in range(55, 226, 18):
     _p = QPen(QColor(255, 255, 255, _a), 1.0)
     _p.setCosmetic(True)
     _EDGE_PENS.append(_p)
-
-
-def _human(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
-        n /= 1024
-    return str(n)
 
 
 def _grid(k: int) -> tuple[int, int]:
@@ -100,6 +93,8 @@ class Nebula(QWidget):
         self._clump_label_pos: dict[int, np.ndarray] = {}
         self._local_rects: list[list[QRectF]] = []
         self._bg_pm: QPixmap | None = None
+        self._tip_key = None
+        self._tip_img: QImage | None = None
         if self.abstract:
             self.clumps = Clumps(groups, self.group_folder, len(self.folder_names))
             self.clump_rects = []
@@ -127,16 +122,19 @@ class Nebula(QWidget):
         self.timer = QTimer(self, interval=1000 // FPS, timeout=self._tick)
         self.timer.start()
 
+    def recount(self):
+        live = [g for g, a in zip(self.groups, self.alive) if a]
+        self.total_imgs = sum(len(g.photos) for g in live)
+        self.saving = sum(g.bytes - g.photos[g.best].size for g in live)
+        self.folders = len({os.path.dirname(p.path) for g in live for p in g.photos})
+        self.n_live = len(live)
+        self.text_scale = 0            # re-render the text
+
     def hide(self, i: int):
         """Group i is done: it leaves the net, the numbers in the middle count down."""
         if 0 <= i < len(self.alive) and self.alive[i]:
             self.alive[i] = False
-            live = [g for g, a in zip(self.groups, self.alive) if a]
-            self.total_imgs = sum(len(g.photos) for g in live)
-            self.saving = sum(g.bytes - g.photos[g.best].size for g in live)
-            self.folders = len({os.path.dirname(p.path) for g in live for p in g.photos})
-            self.n_live = len(live)
-            self.text_scale = 0            # re-render the text
+            self.recount()
             self.alpha = max(self.alpha, 0.3)
             if self.hover == i:
                 self.hover = -1
@@ -245,7 +243,7 @@ class Nebula(QWidget):
                 f"{self.n_live} GROUPS",
                 f"{self.total_imgs} IMAGES",
                 f"{self.folders} FOLDERS",
-                f"{_human(self.saving)} TO FREE",
+                f"{human(self.saving)} TO FREE",
                 "",
                 "READY."]
 
@@ -767,10 +765,15 @@ class Nebula(QWidget):
             qp.restore()
 
     def _draw_tip(self, qp: QPainter, i: int):
-        g = self.groups[i]
-        folders = sorted({os.path.basename(os.path.dirname(p.path)) for p in g.photos})
-        lines = [f"{len(g.photos)} IMAGES  {_human(g.bytes)}"] + folders[:4]
-        img = pixelfont.render(lines, max(1, self.text_scale // 2), WHITE, QColor(0, 0, 0, 255))
+        ts = max(1, self.text_scale // 2)
+        key = (i, ts, len(self.groups[i].photos))
+        if self._tip_key != key or self._tip_img is None:
+            g = self.groups[i]
+            folders = sorted({os.path.basename(os.path.dirname(p.path)) for p in g.photos})
+            lines = [f"{len(g.photos)} IMAGES  {human(g.bytes)}"] + folders[:4]
+            self._tip_img = pixelfont.render(lines, ts, WHITE, QColor(0, 0, 0, 255))
+            self._tip_key = key
+        img = self._tip_img
         pt = QPoint(int(self._mouse_raw[0]), int(self._mouse_raw[1])) if self._mouse_in else self.mapFromGlobal(self.cursor().pos())
         x = min(max(0, pt.x() + 20), self.width() - img.width())
         y = min(max(0, pt.y() + 20), self.height() - img.height())

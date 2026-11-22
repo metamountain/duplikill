@@ -15,9 +15,9 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QStackedWi
 
 from . import czkawka, pixelfont, verify
 from .actions import Mover
-from .index import data_dir
+from .index import data_dir, human
 from .nebula import Nebula
-from .review import AT_END, PER_GROUP, Review, human
+from .review import AT_END, PER_GROUP, Review
 from .thumbs import Thumbs
 
 WHITE, GREY = QColor(255, 255, 255), QColor(150, 150, 150)
@@ -79,12 +79,19 @@ class PixelScreen(QWidget):
     def lines(self) -> list[str]:
         return []
 
-    def paintEvent(self, e):
-        qp = QPainter(self)
+    def _paint_bg(self, qp: QPainter):
         bg = QLinearGradient(0, 0, 0, self.height())
         bg.setColorAt(0, QColor(20, 20, 20))
         bg.setColorAt(1, QColor(0, 0, 0))
         qp.fillRect(self.rect(), bg)
+
+    def _draw_cursor(self, qp: QPainter, x: int, y: int, ts: int):
+        if int(time.time() * 2) % 2 == 0:
+            qp.drawImage(QPoint(x, y), pixelfont.render([" "], ts, WHITE, WHITE))
+
+    def paintEvent(self, e):
+        qp = QPainter(self)
+        self._paint_bg(qp)
         lines = self.lines()
         if not lines:
             return
@@ -93,9 +100,7 @@ class PixelScreen(QWidget):
         img = pixelfont.render(lines, ts)
         tl = QPoint((self.width() - img.width()) // 2, (self.height() - img.height()) // 2 + self._fly_offset())
         qp.drawImage(tl, img)
-        if int(time.time() * 2) % 2 == 0:
-            cur = pixelfont.render([" "], ts, WHITE, WHITE)
-            qp.drawImage(QPoint(tl.x(), tl.y() + img.height()), cur)
+        self._draw_cursor(qp, tl.x(), tl.y() + img.height(), ts)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -259,10 +264,7 @@ class StartScreen(PixelScreen):
 
     def paintEvent(self, e):
         qp = QPainter(self)
-        bg = QLinearGradient(0, 0, 0, self.height())
-        bg.setColorAt(0, QColor(20, 20, 20))
-        bg.setColorAt(1, QColor(0, 0, 0))
-        qp.fillRect(self.rect(), bg)
+        self._paint_bg(qp)
         W, H = self.width(), self.height()
         lw, lh = self._logo_size
         big = max(4, int(W * 0.7 / lw))                           # whole screen pixels per font pixel
@@ -287,8 +289,7 @@ class StartScreen(PixelScreen):
         img = pixelfont.render(lines, ts)
         tl = QPoint((W - img.width()) // 2, y0 + lh * big + 6 * ts)
         qp.drawImage(tl, img)
-        if int(time.time() * 2) % 2 == 0:
-            qp.drawImage(QPoint(tl.x(), tl.y() + img.height()), pixelfont.render([" "], ts, WHITE, WHITE))
+        self._draw_cursor(qp, tl.x(), tl.y() + img.height(), ts)
 
 
 WARN_SECONDS = 90        # a scan longer than this is announced first (big folder: offer subfolders)
@@ -310,21 +311,37 @@ class SearchJob(QThread):
 
     def run(self):
         try:
-            paths = czkawka.list_images(self.root, self.options.excluded, self.stop)
-            n = len(paths)
-            frac = czkawka.cached_fraction(paths, self.options)
-            eta = czkawka.estimate_seconds(n, frac)
-            if self.confirm and eta > WARN_SECONDS:
-                subs = []
-                for name, k in czkawka.subfolders(self.root, paths)[:9]:
-                    pre = os.path.join(self.root, name) + os.sep
-                    sub = [p for p in paths if p.startswith(pre)]
-                    subs.append((name, k, czkawka.estimate_seconds(k, czkawka.cached_fraction(sub, self.options))))
-                self.ask.emit(n, eta, frac, subs)
-                self.go.wait()
+            if self.confirm:
+                paths = czkawka.list_images(self.root, self.options.excluded, self.stop)
                 if self.stop.is_set():
                     raise czkawka.Cancelled()
-            self.counted.emit(n, eta)
+                n = len(paths)
+                frac = czkawka.cached_fraction(paths, self.options)
+                eta = czkawka.estimate_seconds(n, frac)
+                if eta > WARN_SECONDS:
+                    top_subs = czkawka.subfolders(self.root, paths)[:9]
+                    by_top: dict[str, list[str]] = {name: [] for name, _ in top_subs}
+                    root_prefix = self.root.rstrip("\\/") + os.sep
+                    for p in paths:
+                        if p.startswith(root_prefix):
+                            rel = p[len(root_prefix):]
+                            sep_idx = rel.find(os.sep)
+                            if sep_idx > 0:
+                                top = rel[:sep_idx]
+                                bucket = by_top.get(top)
+                                if bucket is not None:
+                                    bucket.append(p)
+                    sub_lists = [by_top[name] for name, _ in top_subs]
+                    sub_fracs = czkawka.cached_fractions(sub_lists, self.options)
+                    subs = [
+                        (name, k, czkawka.estimate_seconds(k, sf))
+                        for (name, k), sf in zip(top_subs, sub_fracs)
+                    ]
+                    self.ask.emit(n, eta, frac, subs)
+                    self.go.wait()
+                    if self.stop.is_set():
+                        raise czkawka.Cancelled()
+                self.counted.emit(n, eta)
             candidates = czkawka.search(self.root, self.options, self.stop)
             groups = verify.refine(candidates, self.sigs, self.stop)          # drop look-alikes
             if self.stop.is_set():
@@ -421,6 +438,11 @@ class SettingsScreen(PixelScreen):
         super().__init__()
         self.settings = settings
         self._geo = None
+        self._stats_cache: tuple[int, int] | None = None
+
+    def showEvent(self, e):
+        self._stats_cache = Mover().stats()
+        super().showEvent(e)
 
     def _value(self, key: str) -> str:
         return dict(self.CHOICES[key]).get(self.settings.get(key), "?")
@@ -442,7 +464,9 @@ class SettingsScreen(PixelScreen):
         return self.HELP.get(key, {}).get(cur, "")
 
     def _rows_with_color(self) -> list[tuple[str, QColor]]:
-        n_moved, b_moved = Mover().stats()
+        if self._stats_cache is None:
+            self._stats_cache = Mover().stats()
+        n_moved, b_moved = self._stats_cache
         out: list[tuple[str, QColor]] = [("SETTINGS", WHITE), ("", WHITE)]
         for n, (key, label) in enumerate(self.ROWS, 1):
             out.append((f"{n} {label.ljust(11)} {self._value(key)}"[:self.COLS].ljust(self.COLS), WHITE))
@@ -462,10 +486,7 @@ class SettingsScreen(PixelScreen):
 
     def paintEvent(self, e):
         qp = QPainter(self)
-        bg = QLinearGradient(0, 0, 0, self.height())
-        bg.setColorAt(0, QColor(20, 20, 20))
-        bg.setColorAt(1, QColor(0, 0, 0))
-        qp.fillRect(self.rect(), bg)
+        self._paint_bg(qp)
         rows = self._rows_with_color()
         ts = max(2, int(0.75 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
         lh = 8 * ts
@@ -477,9 +498,7 @@ class SettingsScreen(PixelScreen):
             if text.strip():
                 img = pixelfont.render([text.ljust(self.COLS)], ts, color)
                 qp.drawImage(QPoint(x0, y0 + idx * lh), img)
-        if int(time.time() * 2) % 2 == 0:
-            cur = pixelfont.render([" "], ts, WHITE, WHITE)
-            qp.drawImage(QPoint(x0, y0 + h), cur)
+        self._draw_cursor(qp, x0, y0 + h, ts)
         self._geo = (x0, y0, w, lh)
 
     def cycle(self, n: int):
@@ -543,10 +562,7 @@ class HelpScreen(PixelScreen):
 
     def paintEvent(self, e):
         qp = QPainter(self)
-        bg = QLinearGradient(0, 0, 0, self.height())
-        bg.setColorAt(0, QColor(20, 20, 20))
-        bg.setColorAt(1, QColor(0, 0, 0))
-        qp.fillRect(self.rect(), bg)
+        self._paint_bg(qp)
         ts = max(2, int(0.78 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
         lh = 8 * ts
         w = self.COLS * lh
@@ -564,9 +580,7 @@ class HelpScreen(PixelScreen):
                 qp.drawImage(QPoint(x0, y), pixelfont.render([k_txt], ts, WHITE))
                 qp.drawImage(QPoint(x0 + len(k_txt) * lh, y),
                              pixelfont.render([desc[:self.COLS - len(k_txt)].ljust(self.COLS - len(k_txt))], ts, GREY))
-        if int(time.time() * 2) % 2 == 0:
-            cur = pixelfont.render([" "], ts, WHITE, WHITE)
-            qp.drawImage(QPoint(x0, y0 + h), cur)
+        self._draw_cursor(qp, x0, y0 + h, ts)
 
 
 class Main(QMainWindow):
@@ -670,6 +684,7 @@ class Main(QMainWindow):
         save_settings(self.settings)
         if self.job is not None and self.job.isRunning():
             self.job.stop.set()
+            self.job.go.set()
             self.job.wait()
         if quiet:
             self.slider.busy = True
@@ -694,6 +709,14 @@ class Main(QMainWindow):
     def cancel(self):
         if self.job is not None:
             self.job.stop.set()
+            self.job.go.set()
+
+    def closeEvent(self, e):
+        if self.job is not None and self.job.isRunning():
+            self.job.stop.set()
+            self.job.go.set()
+            self.job.wait(2000)
+        super().closeEvent(e)
 
     def _counted(self, n, eta):
         self.search.n, self.search.eta = n, eta
@@ -735,6 +758,7 @@ class Main(QMainWindow):
     def _close_now(self):
         if self.job is not None and self.job.isRunning():
             self.job.stop.set()
+            self.job.go.set()
             self.job.wait()
         self.stack.setCurrentWidget(self.start)
         for w in (self.nebula, self.review):
@@ -957,7 +981,8 @@ class Main(QMainWindow):
             return
         for i, paths in todo:
             self._remove_group(i, paths)
-        self._recount()
+        if self.nebula is not None:
+            self.nebula.recount()
         self._update_fire_all()
 
     def _confirm_delete(self, n: int) -> bool:
@@ -1020,7 +1045,8 @@ class Main(QMainWindow):
                 self.review.step(-1)
                 if self.review.i == before:
                     self.overview()
-        self._recount()
+        if self.nebula is not None:
+            self.nebula.recount()
 
     def _mover(self) -> Mover:
         s = self.settings
@@ -1059,18 +1085,8 @@ class Main(QMainWindow):
             self.review.marks.pop(g.key, None)
         self.review.done.discard(g.key)
         self.nebula.alive[i] = True
-        self.nebula.hide(-1)                        # no-op, keeps numbers in sync below
-        self._recount()
+        self.nebula.recount()
         self.open_group(i)
-
-    def _recount(self):
-        n = self.nebula
-        live = [g for g, a in zip(self.groups, n.alive) if a]
-        n.n_live = len(live)
-        n.total_imgs = sum(len(g.photos) for g in live)
-        n.saving = sum(g.bytes - g.photos[g.best].size for g in live)
-        n.folders = len({os.path.dirname(p.path) for g in live for p in g.photos})
-        n.text_scale = 0
 
 
 def main(argv=None):

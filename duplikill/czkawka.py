@@ -6,13 +6,13 @@ and is shared with an installed Krokiet.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from dataclasses import dataclass, field
 
 from .groups import Group
@@ -74,7 +74,7 @@ def list_images(root: str, excluded: list[str] | None = None, stop: threading.Ev
                 for e in it:
                     try:
                         if e.is_dir(follow_symlinks=False):
-                            if not _excluded(e.path, ex) and e.name.lower() not in ("$recycle.bin", "duplikill"):
+                            if (not ex or not _excluded(e.path, ex)) and e.name.lower() not in ("$recycle.bin", "duplikill"):
                                 stack.append(e.path)
                         elif os.path.splitext(e.name)[1].lower() in IMAGE_EXT and e.stat().st_size >= MIN_SIZE:
                             out.append(e.path)
@@ -89,22 +89,55 @@ def count_images(root: str, excluded: list[str] | None = None, stop: threading.E
     return len(list_images(root, excluded, stop))
 
 
+def _load_cache_blob(o: Options) -> bytes:
+    if not o.use_cache:
+        return b""
+    base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Qarmin", "Czkawka", "cache")
+    files = glob.glob(os.path.join(base, f"cache_similar_images_{o.hash_size}_{o.hash_alg}_{o.image_filter}_*.bin"))
+    if not files:
+        return b""
+    chunks = []
+    try:
+        for f in files:
+            with open(f, "rb") as fh:
+                chunks.append(fh.read())
+    except OSError:
+        return b""
+    return b"".join(chunks).lower()
+
+
+def cached_fractions(path_lists: list[list[str]], o: Options, sample: int = 200) -> list[float]:
+    """Batched cached_fraction across multiple path lists, reading Czkawka cache files at most once."""
+    if not path_lists:
+        return []
+    data = _load_cache_blob(o)
+    if not data:
+        return [1.0 if not ps else 0.0 for ps in path_lists]
+    seen: dict[bytes, bool] = {}
+    out: list[float] = []
+    for ps in path_lists:
+        if not ps:
+            out.append(1.0)
+            continue
+        step = max(1, len(ps) // sample)
+        pick = [p.lower().encode("utf-8") for p in ps[::step][:sample]]
+        hits = 0
+        for n in pick:
+            ok = seen.get(n)
+            if ok is None:
+                ok = n in data
+                seen[n] = ok
+            if ok:
+                hits += 1
+        out.append(hits / len(pick))
+    return out
+
+
 def cached_fraction(paths: list[str], o: "Options", sample: int = 200) -> float:
     """Share of the images Czkawka already has hashed (its cache file stores the paths as text)."""
     if not paths:
         return 1.0
-    import glob
-    base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Qarmin", "Czkawka", "cache")
-    files = glob.glob(os.path.join(base, f"cache_similar_images_{o.hash_size}_{o.hash_alg}_{o.image_filter}_*.bin"))
-    if not files:
-        return 0.0
-    try:
-        data = b"".join(open(f, "rb").read() for f in files).lower()
-    except OSError:
-        return 0.0
-    step = max(1, len(paths) // sample)
-    pick = paths[::step][:sample]
-    return sum(p.lower().encode("utf-8") in data for p in pick) / len(pick)
+    return cached_fractions([paths], o, sample)[0]
 
 
 def subfolders(root: str, paths: list[str]) -> list[tuple[str, int]]:
@@ -122,25 +155,49 @@ def estimate_seconds(n_images: int, cached_fraction: float = 0.0) -> float:
     return n_images * ((1 - cached_fraction) / SPEED_UNCACHED + cached_fraction / SPEED_CACHED)
 
 
-def _real(path: str) -> str | None:
-    """czkawka reports paths in lower case; get the spelling on disk (None if the file is gone)."""
-    if not os.path.isfile(path):
-        return None
-    return os.path.realpath(path)
-
-
 def parse(json_path: str) -> list[Group]:
     with open(json_path, encoding="utf-8") as fh:
         raw = json.load(fh)
+    dir_files: dict[str, dict[str, tuple[str, bool]]] = {}
     groups = []
     for items in raw:
         photos = []
         seen = set()
         for it in items:
-            p = _real(it["path"])
-            if p is None or os.path.normcase(p) in seen or "duplikill" in os.path.normcase(p).split(os.sep)[:-1]:
+            raw_path = it["path"]
+            norm_raw = os.path.normcase(raw_path)
+            if "duplikill" in norm_raw.split(os.sep)[:-1]:
                 continue
-            seen.add(os.path.normcase(p))
+            dn, fn = os.path.dirname(raw_path), os.path.basename(raw_path)
+            dk = os.path.normcase(dn)
+            files = dir_files.get(dk)
+            if files is None:
+                files = {}
+                try:
+                    rd = os.path.realpath(dn or ".", strict=True)
+                    with os.scandir(rd) as it_dir:
+                        for e in it_dir:
+                            try:
+                                if e.is_file():
+                                    files[os.path.normcase(e.name)] = (e.path, e.is_symlink())
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+                dir_files[dk] = files
+            hit = files.get(os.path.normcase(fn))
+            if hit is None:
+                continue
+            p, is_sym = hit
+            if is_sym:
+                try:
+                    p = os.path.realpath(p, strict=True)
+                except OSError:
+                    continue
+            np_ = os.path.normcase(p)
+            if np_ in seen or "duplikill" in np_.split(os.sep)[:-1]:
+                continue
+            seen.add(np_)
             photos.append(Photo(path=p, size=it.get("size", 0), mtime=float(it.get("modified_date", 0)),
                                 width=it.get("width", 0), height=it.get("height", 0),
                                 diff=int(it.get("difference", 0))))
@@ -171,11 +228,14 @@ def search(root: str, o: Options, stop: threading.Event | None = None, workdir: 
                     proc.kill()
                     proc.wait()
                     raise Cancelled()
-                time.sleep(0.2)
+                try:
+                    proc.wait(timeout=0.05)
+                except subprocess.TimeoutExpired:
+                    pass
         if proc.returncode != 0 or not os.path.exists(out):
             with open(log_path, encoding="utf-8", errors="replace") as fh:
                 tail = fh.read()[-2000:]
-            raise RuntimeError(f"czkawka_cli ist mit Code {proc.returncode} beendet:\n{tail}")
+            raise RuntimeError(f"czkawka_cli exited with code {proc.returncode}:\n{tail}")
         return parse(out)
     finally:
         for p in (out, log_path):
