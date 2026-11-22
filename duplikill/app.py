@@ -25,7 +25,7 @@ SETTINGS = os.path.join(data_dir(), "settings.json")
 DEFAULTS = {"action": "move",          # move | trash | delete
             "target_mode": "central",  # central: <drive>\\Duplikill\\<path> | folder: <scan>\\Duplikill\\<path> | custom
             "target": "",              # the folder for target_mode custom
-            "fire": PER_GROUP, "max_diff": 12, "hash_size": 8,
+            "fire": PER_GROUP, "pan": "middle", "max_diff": 12, "hash_size": 8,
             "last_root": "", "window": "fullscreen"}         # window: fullscreen | window
 SLIDER_MAX = 17                         # hash size 8: user-tested 2026-11-22, above 17 unrelated images get grouped
 
@@ -278,6 +278,8 @@ class StartScreen(PixelScreen):
         ys = np.rint(fy + (ty - fy) * k).astype(int)
         for x, y in zip(xs, ys):
             qp.fillRect(int(x), int(y), big, big, WHITE)
+        self.logo_bottom = y0 + lh * big                           # the folder dialog opens below this
+        self.logo_width = lw * big
         if el < self.INTRO:
             return
         lines = self.lines()
@@ -376,16 +378,44 @@ class SearchScreen(PixelScreen):
 
 
 class SettingsScreen(PixelScreen):
-    """Pixel list of options; a key 1-5 or a click on a line switches to the next choice."""
+    """Fixed-grid pixel settings screen with grey help lines; never shifts or rescales when cycling."""
     changed = Signal(str)                  # the key that changed
+    COLS = 48
+    N_LINES = 18
 
     CHOICES = {
         "window": [("fullscreen", "FULLSCREEN"), ("window", "WINDOW")],
         "action": [("move", "MOVE"), ("trash", "RECYCLE BIN"), ("delete", "DELETE FOREVER")],
         "target_mode": [("central", "CENTRAL"), ("folder", "IN SCANNED FOLDER"), ("custom", "OWN FOLDER")],
         "fire": [(PER_GROUP, "EACH GROUP"), (AT_END, "AT THE END")],
+        "pan": [("middle", "MIDDLE BUTTON"), ("right", "RIGHT BUTTON")],
     }
-    ROWS = [("window", "WINDOW"), ("action", "REMOVE BY"), ("target_mode", "MOVE TO"), ("fire", "DELETE")]
+    HELP = {
+        "window": {
+            "fullscreen": "BORDERLESS FULLSCREEN (F11 TOGGLES)",
+            "window": "RESIZABLE DARK WINDOW (F11 TOGGLES)",
+        },
+        "action": {
+            "move": "FAST MOVE + XMP SIDECARS, CTRL+Z UNDO",
+            "trash": "WINDOWS RECYCLE BIN + XMP SIDECARS",
+            "delete": "PERMANENTLY DELETE FILES (ASKS ONCE)",
+        },
+        "fire": {
+            PER_GROUP: "DEL REMOVES MARKED & OPENS NEXT GROUP",
+            AT_END: "MARK FIRST, PRESS DEL IN OVERVIEW",
+        },
+        "pan": {
+            "middle": "MIDDLE DRAG = PAN, RIGHT HOLD = BLINK",
+            "right": "RIGHT DRAG = PAN, MIDDLE HOLD = BLINK",
+        },
+    }
+    ROWS = [
+        ("window", "WINDOW"),
+        ("action", "REMOVE BY"),
+        ("target_mode", "MOVE TO"),
+        ("fire", "DELETE"),
+        ("pan", "MOUSE PAN"),
+    ]
 
     def __init__(self, settings: dict):
         super().__init__()
@@ -396,29 +426,61 @@ class SettingsScreen(PixelScreen):
         return dict(self.CHOICES[key]).get(self.settings.get(key), "?")
 
     def _where(self) -> str:
+        if self.settings.get("action", "move") != "move":
+            return "(ONLY USED WHEN REMOVE BY = MOVE)"
         m = self.settings.get("target_mode", "central")
         if m == "central":
-            return "D:\\DUPLIKILL\\<PATH>"
+            return "<DRIVE>:\\DUPLIKILL\\<ORIGINAL PATH>"
         if m == "folder":
-            return "<FOLDER>\\DUPLIKILL\\<PATH>"
-        return (self.settings.get("target") or "(NONE)").upper()[:30]
+            return "<SCANNED FOLDER>\\DUPLIKILL\\<PATH>"
+        return ("FOLDER: " + (self.settings.get("target") or "(NONE)").upper())[:44]
 
-    def lines(self):
-        out = ["SETTINGS", ""]
+    def _help(self, key: str) -> str:
+        if key == "target_mode":
+            return self._where()
+        cur = self.settings.get(key)
+        return self.HELP.get(key, {}).get(cur, "")
+
+    def _rows_with_color(self) -> list[tuple[str, QColor]]:
+        n_moved, b_moved = Mover().stats()
+        out: list[tuple[str, QColor]] = [("SETTINGS", WHITE), ("", WHITE)]
         for n, (key, label) in enumerate(self.ROWS, 1):
-            out.append(f"{n} {label.ljust(10)} {self._value(key)}")
-            if key == "target_mode":
-                out.append(f"  {'':10} {self._where()}")
-        out += ["", "KEY 1-4 OR CLICK: CHANGE", "ESC: BACK"]
+            out.append((f"{n} {label.ljust(11)} {self._value(key)}"[:self.COLS].ljust(self.COLS), WHITE))
+            out.append((f"  {self._help(key)}"[:self.COLS].ljust(self.COLS), GREY))
+        out += [
+            ("", WHITE),
+            ("CONTROLS: CLICK=CROSS  SKULL=KILL ONE  0=FIT".ljust(self.COLS), GREY),
+            ("WHEEL=ZOOM  SPACE/ARROWS=GROUP  TAB=SOLO".ljust(self.COLS), GREY),
+            (f"JOURNAL: {n_moved} MOVED ({human(b_moved)})  CFG: SETTINGS.JSON"[:self.COLS].ljust(self.COLS), GREY),
+            ("", WHITE),
+            ("KEY 1-5 OR CLICK ROW: CHANGE    ESC: BACK".ljust(self.COLS), WHITE),
+        ]
         return out
 
+    def lines(self) -> list[str]:
+        return [text.ljust(self.COLS) for text, _ in self._rows_with_color()]
+
     def paintEvent(self, e):
-        super().paintEvent(e)
-        lines = self.lines()
-        cols = max(len(l) for l in lines)
-        ts = max(2, int(0.6 * min(self.width(), self.height() * 1.6) / (cols * 8)))
-        top = (self.height() - len(lines) * 8 * ts) // 2
-        self._geo = (top, 8 * ts)
+        qp = QPainter(self)
+        bg = QLinearGradient(0, 0, 0, self.height())
+        bg.setColorAt(0, QColor(20, 20, 20))
+        bg.setColorAt(1, QColor(0, 0, 0))
+        qp.fillRect(self.rect(), bg)
+        rows = self._rows_with_color()
+        ts = max(2, int(0.75 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
+        lh = 8 * ts
+        w = self.COLS * lh
+        h = len(rows) * lh
+        x0 = (self.width() - w) // 2
+        y0 = (self.height() - h) // 2 + self._fly_offset()
+        for idx, (text, color) in enumerate(rows):
+            if text.strip():
+                img = pixelfont.render([text.ljust(self.COLS)], ts, color)
+                qp.drawImage(QPoint(x0, y0 + idx * lh), img)
+        if int(time.time() * 2) % 2 == 0:
+            cur = pixelfont.render([" "], ts, WHITE, WHITE)
+            qp.drawImage(QPoint(x0, y0 + h), cur)
+        self._geo = (x0, y0, w, lh)
 
     def cycle(self, n: int):
         """Next choice of row n (1-based)."""
@@ -434,14 +496,12 @@ class SettingsScreen(PixelScreen):
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton or self._geo is None:
             return
-        top, lh = self._geo
+        x0, top, w, lh = self._geo
+        if not (x0 <= e.position().x() <= x0 + w):
+            return
         line = int((e.position().y() - top) // lh)
-        row = 0
-        for n, (key, _) in enumerate(self.ROWS, 1):          # map screen line -> row (MOVE TO has 2 lines)
-            first = 2 + (n - 1) + (1 if n > 3 else 0)
-            if line == first or (key == "target_mode" and line == first + 1):
-                row = n
-        self.cycle(row)
+        if 2 <= line < 2 + 2 * len(self.ROWS):
+            self.cycle((line - 2) // 2 + 1)
 
 
 class Main(QMainWindow):
@@ -495,10 +555,42 @@ class Main(QMainWindow):
         QApplication.instance().installEventFilter(self)
 
     # ------------------------------------------------------------ search
+    DIALOG_TITLE = "Duplikill - open folder"
+
     def pick(self):
-        root = QFileDialog.getExistingDirectory(self, "Open folder", self.settings.get("last_root") or "")
+        """Windows folder dialog, moved to the middle right below the logo (or the middle of the window)."""
+        top = self.mapToGlobal(QPoint(0, 0)).y()
+        if self.stack.currentWidget() is self.start and getattr(self.start, "logo_bottom", None):
+            y = self.start.mapToGlobal(QPoint(0, self.start.logo_bottom)).y() + 24
+            w = self.start.logo_width
+        else:
+            y = top + self.height() // 4
+            w = int(self.width() * 0.7)
+        h = max(360, top + self.height() - y - 40)              # fits into the window below the logo
+        x = self.mapToGlobal(QPoint(self.width() // 2, 0)).x()
+        self._dialog_at, self._dialog_tries = (x, y, w, h), 0
+        self._dialog_timer = QTimer(self, interval=15, timeout=self._move_dialog)
+        self._dialog_timer.start()
+        root = QFileDialog.getExistingDirectory(self, self.DIALOG_TITLE, self.settings.get("last_root") or "")
+        self._dialog_timer.stop()
         if root:
             self.run_search(os.path.normpath(root))
+
+    def _move_dialog(self):
+        """Runs while the native dialog is open: finds it by its title and centres it at _dialog_at."""
+        self._dialog_tries += 1
+        if self._dialog_tries > 200 or sys.platform != "win32":
+            self._dialog_timer.stop()
+            return
+        import ctypes
+        u32 = ctypes.windll.user32
+        hwnd = u32.FindWindowW(None, self.DIALOG_TITLE)
+        if not hwnd:
+            return
+        dpr = self.devicePixelRatioF()                        # Qt works in logical pixels, Windows in physical
+        x, y, w, h = self._dialog_at
+        u32.SetWindowPos(hwnd, 0, int((x - w / 2) * dpr), int(y * dpr), int(w * dpr), int(h * dpr), 0x0004)  # NOZORDER
+        self._dialog_timer.stop()
 
     def run_search(self, root: str, quiet: bool = False):
         """quiet = new strictness: the overview stays, only the slider shows that it is searching."""
@@ -675,7 +767,7 @@ class Main(QMainWindow):
         if self.open_btn.isVisible():
             self.open_btn.place_bottom_left(0)
             self.close_btn.place_bottom_left(len(self.open_btn.text) + 3)
-        self._screen_changed(0)
+        QTimer.singleShot(0, lambda: self._screen_changed(0))   # after the stack has its new size
 
     # ------------------------------------------------------------ settings
     def open_settings(self):
@@ -700,6 +792,8 @@ class Main(QMainWindow):
             self.apply_window_mode()
         if key == "fire" and self.review is not None:
             self.review.mode = s["fire"]
+        if key == "pan" and self.review is not None:
+            self.review.pan = s["pan"]
         if key == "action":
             self._delete_ok = False
         save_settings(s)
@@ -716,6 +810,7 @@ class Main(QMainWindow):
         self.nebula = Nebula(groups, self.thumbs, root=self.root)
         self.review = Review(groups, self.thumbs)
         self.review.mode = self.settings["fire"]
+        self.review.pan = self.settings.get("pan", "middle")
         self.stack.addWidget(self.nebula)
         self.stack.addWidget(self.review)
         self.nebula.group_clicked.connect(self.open_group)

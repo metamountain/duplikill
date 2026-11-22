@@ -152,3 +152,68 @@ def test_skull_on_hovered_image_kills_one(app):
     r.marks[g.key] = {2}
     j = r.remove_photo(target)
     assert j == 1 and len(g.photos) == 2 and r.marked() == {1}
+
+
+def test_settings_layout_never_jumps(app):
+    from duplikill.app import DEFAULTS, SettingsScreen
+    s = SettingsScreen(dict(DEFAULTS))
+    s.resize(1600, 950)
+    s._t_in = 0.0
+    s.grab()
+    base_geo = s._geo
+    assert base_geo is not None
+    for row in range(1, len(s.ROWS) + 1):
+        for _ in range(3):
+            s.cycle(row)
+            s._t_in = 0.0
+            s.grab()
+            assert s._geo == base_geo, f"Row {row} caused settings layout jump: {s._geo} != {base_geo}"
+
+
+def test_central_switches_pair_and_six_grid_and_right_pan(app):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    mk = lambda name, sz=1000: Photo(path=f"C:\\x\\{name}.jpg", size=sz, mtime=0, width=400, height=300, sharp=sz)
+    pair = Group("similar", [mk("p1", 2000), mk("p2", 1000)])
+    six = Group("similar", [mk(f"s{i}", 1000 + i * 100) for i in range(6)])
+    r = Review([pair, six], FakeThumbs())
+    r.resize(1600, 900)
+
+    # 1. 2-image pair: switches near center seam, 1-click smart swap
+    r.show_group(0)
+    r.grab()
+    assert abs(r.hub_rect.center().x() - 800) < 5 and abs(r.hub_rect.center().y() - 450) < 5
+    for j, kr in r.kill_rects.items():
+        assert abs(kr.center().x() - 800) < 120   # right next to vertical center seam, not at (0,0)!
+        assert not kr.contains(r.rects[j].center())
+    r.toggle(0)
+    assert r.marked() == {0}
+    r.toggle(1)                                   # 2-image smart swap: switches directly to {1}
+    assert r.marked() == {1}
+
+    # 2. 6-image group: 3 stay/3 go, keep_only, keep_best
+    r.show_group(1)
+    r.grab()
+    assert not r.keep_best_rect.isNull()
+    for j in (0, 2, 4):
+        r.toggle(j)
+    assert r.marked() == {0, 2, 4}                # 6 images: 3 stay (1,3,5), 3 go (0,2,4)
+    r.keep_only(1)
+    assert r.marked() == {0, 2, 3, 4, 5}
+    r.toggle(3)                                   # keep 1 and 3
+    assert r.marked() == {0, 2, 4, 5}
+    r.keep_best()
+    assert r.marked() == {k for k in range(6) if k != six.best}
+
+    # 3. Configurable right-mouse pan / middle-mouse blink
+    r.pan = "right"
+    ev_mid = lambda t: QMouseEvent(t, QPointF(10, 10), QPointF(10, 10), Qt.MiddleButton, Qt.MiddleButton, Qt.NoModifier)
+    r.mousePressEvent(ev_mid(QEvent.MouseButtonPress))
+    assert r.swap == 1
+    r.mouseReleaseEvent(ev_mid(QEvent.MouseButtonRelease))
+    assert r.swap == 0
+    ev_right = lambda t: QMouseEvent(t, QPointF(10, 10), QPointF(10, 10), Qt.RightButton, Qt.RightButton, Qt.NoModifier)
+    r.mousePressEvent(ev_right(QEvent.MouseButtonPress))
+    assert r._press is not None and r.swap == 0
+    r.mouseReleaseEvent(ev_right(QEvent.MouseButtonRelease))
+    assert r._press is None

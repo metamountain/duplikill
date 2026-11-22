@@ -95,7 +95,17 @@ class Review(QWidget):
         self.marks: dict[str, set[int]] = {}           # group key -> marked image indices
         self.done: set[str] = set()                    # groups already handled
         self.mode = PER_GROUP
+        self.pan = "middle"                            # "middle" | "right"
         self.i = 0
+        self.kill_rect = QRectF()
+        self.kill_j = -1
+        self.kill_rects: dict[int, QRectF] = {}
+        self.only_rects: dict[int, QRectF] = {}
+        self.fire_rect = QRectF()
+        self.keep_best_rect = QRectF()
+        self.prev_rect = QRectF()
+        self.next_rect = QRectF()
+        self.hub_rect = QRectF()
         self.hover = -1
         self.solo: int | None = None                   # one image alone
         self.swap = 0                                  # 1 while the right button is held (blink)
@@ -160,8 +170,38 @@ class Review(QWidget):
         m = self.marked()
         if j in m:
             m.discard(j)
+        elif len(g.photos) == 2 and len(m) == 1:    # 2-image pair: 1-click swap to the other photo
+            m.clear()
+            m.add(j)
         elif len(m) < len(g.photos) - 1:            # one image always stays
             m.add(j)
+        self.marks_changed.emit()
+        self.update()
+
+    def keep_only(self, j: int):
+        """Cross out all other images in this group (or clear if already only j)."""
+        g = self.group
+        if g is None or not 0 <= j < len(g.photos) or len(g.photos) < 2:
+            return
+        m = self.marked()
+        others = {k for k in range(len(g.photos)) if k != j}
+        if m == others:
+            m.clear()
+        else:
+            m.clear()
+            m.update(others)
+        self.marks_changed.emit()
+        self.update()
+
+    def keep_best(self):
+        """Cross out all images except g.best."""
+        g = self.group
+        if g is None or len(g.photos) < 2:
+            return
+        best = g.best if 0 <= g.best < len(g.photos) else 0
+        m = self.marked()
+        m.clear()
+        m.update(k for k in range(len(g.photos)) if k != best)
         self.marks_changed.emit()
         self.update()
 
@@ -269,8 +309,34 @@ class Review(QWidget):
     def _ts(self) -> int:
         return max(2, min(self.width(), self.height()) // 450)
 
+    def _hub_anchor(self, n_vis: int, w: int, h: int) -> tuple[float, float, int, int]:
+        """Return (hub_cx, hub_cy, cols, rows) snapped to the grid seam closest to (w/2, h/2)."""
+        cols, rows, _ = layout(n_vis, w, h)
+        if n_vis <= 1:
+            return w / 2, -1.0, cols, rows
+        cw = (w - GAP * (cols - 1)) / cols
+        ch = (h - GAP * (rows - 1)) / rows
+        v_seams = [c * (cw + GAP) - GAP / 2 for c in range(1, cols)]
+        h_seams = [r * (ch + GAP) - GAP / 2 for r in range(1, rows)]
+        if rows % 2 == 0:
+            return w / 2, h / 2, cols, rows
+        if rows == 1 and cols % 2 == 0:
+            return w / 2, h / 2, cols, rows
+        if rows >= 2:
+            cy = min(h_seams, key=lambda y: abs(y - h / 2))
+            return w / 2, cy, cols, rows
+        cx = min(v_seams, key=lambda x: abs(x - w / 2))
+        return cx, h / 2, cols, rows
+
     def paintEvent(self, e):
         self.kill_rect = QRectF()
+        self.kill_rects.clear()
+        self.only_rects.clear()
+        self.fire_rect = QRectF()
+        self.keep_best_rect = QRectF()
+        self.prev_rect = QRectF()
+        self.next_rect = QRectF()
+        self.hub_rect = QRectF()
         qp = QPainter(self)
         qp.fillRect(self.rect(), QColor(0, 0, 0))
         g = self.group
@@ -283,35 +349,37 @@ class Review(QWidget):
         ts = self._ts()
         for j0, cell in zip(vis, rects):
             self.rects[j0] = cell
-            j = (j0 + self.swap) % len(g.photos)        # held right button: the next image in this cell
+            j = (j0 + self.swap) % len(g.photos)        # held blink button: the next image in this cell
             p = g.photos[j]
             thumb = self._thumb(p.path)
             iw, ih = self._dims(p, thumb)
             s, src = self._view(cell, iw, ih)
             qp.save()
             qp.setClipRect(cell)
-            # what the source rect covers on screen (may be smaller than the cell when zoomed out)
             img_rect = QRectF(cell.center().x() - iw * s / 2 + (0.5 - self.center[0]) * iw * s,
                               cell.center().y() - ih * s / 2 + (0.5 - self.center[1]) * ih * s, iw * s, ih * s)
             need_full = thumb is None or s * iw > thumb.width() * 1.05
             orig = self._original(p.path) if need_full and self.zoom > 1.0 else None
             if orig is not None:
-                qp.setRenderHint(QPainter.SmoothPixmapTransform, s < 1.0)   # from 100 %: exact pixels
+                qp.setRenderHint(QPainter.SmoothPixmapTransform, s < 1.0)
                 qp.drawImage(img_rect, orig, QRectF(orig.rect()))
             elif thumb is not None:
                 qp.setRenderHint(QPainter.SmoothPixmapTransform, True)
                 qp.drawPixmap(img_rect, thumb, QRectF(thumb.rect()))
             if j in m:
                 self._cross(qp, img_rect.intersected(cell))
-            if j0 == self.hover and self.swap == 0 and len(g.photos) > 1:
-                self._skull(qp, img_rect.intersected(cell), j, ts)
             folder = os.path.basename(os.path.dirname(p.path))
             zoom_txt = f"   {s * 100:.0f} %" if self.zoom > 1.0 else ""
-            cap = pixelfont.render([f"{int(iw)}X{int(ih)}  {human(p.size)}{zoom_txt}", folder],
+            best_txt = "BEST  " if j == g.best else ""
+            cap = pixelfont.render([f"{best_txt}{int(iw)}X{int(ih)}  {human(p.size)}{zoom_txt}", folder],
                                    ts, GREY if j in m else WHITE, BLACK_BG)
-            qp.drawImage(QPoint(int(cell.left()), int(cell.bottom()) - cap.height()), cap)
+            top_row = len(vis) > layout(len(vis), self.width(), self.height())[0] and cell.center().y() < self.height() / 2
+            cap_y = int(cell.top()) if top_row else int(cell.bottom()) - cap.height()
+            qp.drawImage(QPoint(int(cell.left()), cap_y), cap)
             qp.restore()
-        self._status(qp, g, ts)
+        self._status(qp, g, ts, vis, rects)
+        if self.swap == 0 and len(g.photos) > 1 and len(vis) > 1:
+            self._draw_cell_switches(qp, g, ts, vis, rects)
 
     def _cross(self, qp: QPainter, rect: QRectF):
         """Image dimmed, a big X over it in thin white lines."""
@@ -327,15 +395,63 @@ class Review(QWidget):
         qp.drawLine(r.topRight(), r.bottomLeft())
         qp.setRenderHint(QPainter.Antialiasing, False)
 
-    def _skull(self, qp: QPainter, rect: QRectF, j: int, ts: int):
-        """Pixel skull top left on the image under the mouse: click = this image goes at once."""
-        icon = pixelfont.render_bits(pixelfont.icon("skull"), ts * 3, WHITE, QColor(0, 0, 0, 170))
+    def _draw_cell_switches(self, qp: QPainter, g: Group, ts: int, vis: list[int], rects: list[QRectF]):
+        """Per-cell switch pill at the inner seam edge closest to the Central Hub (never at top-left or photo center)."""
+        W, H = self.width(), self.height()
+        hub_cx, hub_cy, _, rows = self._hub_anchor(len(vis), W, H)
         pad = ts * 2
-        x, y = int(rect.left()) + pad, int(rect.top()) + pad
-        qp.fillRect(QRectF(x - pad, y - pad, icon.width() + 2 * pad, icon.height() + 2 * pad), QColor(0, 0, 0, 170))
-        qp.drawImage(QPoint(x, y), icon)
-        self.kill_rect = QRectF(x - pad, y - pad, icon.width() + 2 * pad, icon.height() + 2 * pad)
-        self.kill_j = j
+        hub_guard = self.hub_rect.adjusted(-pad * 2, -pad * 2, pad * 2, pad * 2)
+        n = len(g.photos)
+        m = self.marked()
+        skull_icon = pixelfont.render_bits(pixelfont.icon("skull"), ts * 2, WHITE, QColor(0, 0, 0, 0))
+        sk_w = skull_icon.width() + 2 * pad
+        sk_h = skull_icon.height() + 2 * pad
+        only_img = pixelfont.render(["ONLY"], ts, WHITE, QColor(0, 0, 0, 0)) if n >= 3 else None
+        on_w = (only_img.width() + 2 * pad) if only_img is not None else 0
+        sw_w = sk_w + (GAP + on_w if on_w else 0)
+        sw_h = sk_h
+
+        for j0, cell in zip(vis, rects):
+            xmin = cell.left() + pad + sw_w / 2
+            xmax = cell.right() - pad - sw_w / 2
+            ymin = cell.top() + pad + sw_h / 2
+            ymax = cell.bottom() - pad - sw_h / 2
+            px = min(max(hub_cx, xmin), xmax)
+            py = min(max(hub_cy, ymin), ymax)
+            r = QRectF(px - sw_w / 2, py - sw_h / 2, sw_w, sw_h)
+            if r.intersects(hub_guard):
+                if rows == 1:
+                    above_y = hub_guard.top() - sw_h / 2
+                    py = above_y if above_y >= ymin else min(ymax, hub_guard.bottom() + sw_h / 2)
+                elif cell.center().y() < hub_cy:
+                    py = max(ymin, hub_guard.top() - sw_h / 2)
+                else:
+                    py = min(ymax, hub_guard.bottom() + sw_h / 2)
+                r = QRectF(px - sw_w / 2, py - sw_h / 2, sw_w, sw_h)
+
+            bg = QColor(0, 0, 0, 215 if j0 == self.hover else 165)
+            cur_x = r.left()
+            if only_img is not None:
+                is_only = (len(m) == n - 1 and j0 not in m)
+                o_rect = QRectF(cur_x, r.top(), on_w, sw_h)
+                qp.fillRect(o_rect, WHITE if is_only else bg)
+                o_fg = QColor(0, 0, 0) if is_only else (WHITE if j0 == self.hover else GREY)
+                o_render = pixelfont.render(["ONLY"], ts, o_fg, QColor(0, 0, 0, 0))
+                qp.drawImage(QPoint(int(o_rect.left() + pad), int(o_rect.top() + (sw_h - o_render.height()) / 2)), o_render)
+                self.only_rects[j0] = o_rect
+                cur_x += on_w + GAP
+
+            k_rect = QRectF(cur_x, r.top(), sk_w, sw_h)
+            qp.fillRect(k_rect, bg)
+            sk_fg = WHITE if j0 == self.hover else GREY
+            sk_render = pixelfont.render_bits(pixelfont.icon("skull"), ts * 2, sk_fg, QColor(0, 0, 0, 0))
+            qp.drawImage(QPoint(int(k_rect.left() + pad), int(k_rect.top() + pad)), sk_render)
+            self.kill_rects[j0] = k_rect
+
+        target_j = self.hover if self.hover in self.kill_rects else (vis[0] if vis else -1)
+        if target_j in self.kill_rects:
+            self.kill_rect = self.kill_rects[target_j]
+            self.kill_j = target_j
 
     def remove_photo(self, path: str) -> int:
         """Drops one picture from the current group (after the skull). Returns its old index."""
@@ -359,25 +475,79 @@ class Review(QWidget):
         g.best = pick_best(g)
         self.marks[g.key] = {k + (k >= j) for k in self.marks.get(g.key, set())}
 
-    def _status(self, qp: QPainter, g: Group, ts: int):
+    def _status(self, qp: QPainter, g: Group, ts: int, vis: list[int], rects: list[QRectF]):
+        """Central Hub right at the seam intersection (W/2, H/2): status + nav on Row 1, action on Row 2."""
+        W, H = self.width(), self.height()
+        hub_cx, hub_cy, _, _ = self._hub_anchor(len(vis), W, H)
         m = self.marked()
         left = len([x for x in self.groups if x.key not in self.done])
         free = sum(g.photos[j].size for j in m)
-        text = (f"GROUP {self.i + 1}/{len(self.groups)}  {len(g.photos)} IMAGES  "
-                f"{len(m)} X  {human(free)}  LEFT {left}")
-        img = pixelfont.render([text], ts, WHITE, BLACK_BG)
-        qp.drawImage(QPoint(self.width() - img.width(), 0), img)
-        # the delete button: only while something is crossed out (per-group mode)
-        self.fire_rect = QRectF()
+        pad = ts * 2
+
+        nav_text = f" <  {self.i + 1}/{len(self.groups)}  {len(g.photos)} IMG  {left}L  > "
+        row1 = pixelfont.render([nav_text], ts, WHITE, QColor(0, 0, 0, 220))
+        w1, h1 = row1.width(), row1.height() + pad
+
+        row2 = None
+        action_kind = ""
         if m and self.mode == PER_GROUP:
-            big = ts * 2
-            label = f"{len(m)} X DELETE  {human(free)} "
-            # inverted: black on white, pixel trash can in front
-            btn = pixelfont.render_bits(pixelfont.with_icon("trash", label), big, QColor(0, 0, 0), WHITE)
-            x = (self.width() - btn.width()) // 2
-            y = int(self.height() * 0.88) - btn.height()            # above the captions
-            qp.drawImage(QPoint(x, y), btn)
-            self.fire_rect = QRectF(x, y, btn.width(), btn.height())
+            label = f"{len(m)} X DEL  {human(free)} "
+            raw2 = pixelfont.render_bits(pixelfont.with_icon("trash", label), ts, QColor(0, 0, 0), WHITE)
+            row2 = QImage(raw2.width() + pad, raw2.height() + pad, QImage.Format_RGBA8888)
+            row2.fill(WHITE)
+            p2 = QPainter(row2)
+            p2.drawImage(QPoint(pad // 2, pad // 2), raw2)
+            p2.end()
+            action_kind = "fire"
+        elif m and self.mode == AT_END:
+            label = f" {len(m)} X MARKED  NEXT > "
+            raw2 = pixelfont.render([label], ts, QColor(0, 0, 0), WHITE)
+            row2 = QImage(raw2.width() + pad, raw2.height() + pad, QImage.Format_RGBA8888)
+            row2.fill(WHITE)
+            p2 = QPainter(row2)
+            p2.drawImage(QPoint(pad // 2, pad // 2), raw2)
+            p2.end()
+            action_kind = "next_end"
+        elif not m and len(g.photos) >= 3 and len(vis) >= 3:
+            raw2 = pixelfont.render([" KEEP BEST "], ts, WHITE, QColor(0, 0, 0, 220))
+            row2 = QImage(raw2.width() + pad, raw2.height() + pad, QImage.Format_RGBA8888)
+            row2.fill(QColor(0, 0, 0, 220))
+            p2 = QPainter(row2)
+            p2.drawImage(QPoint(pad // 2, pad // 2), raw2)
+            p2.end()
+            action_kind = "keep_best"
+
+        w2 = row2.width() if row2 is not None else 0
+        h2 = row2.height() if row2 is not None else 0
+        hub_w = max(w1, w2)
+        hub_h = h1 + (GAP + h2 if h2 else 0)
+        if hub_cy < 0:
+            hub_x = (W - hub_w) / 2
+            hub_y = pad
+        else:
+            hub_x = min(max(pad, hub_cx - hub_w / 2), W - hub_w - pad)
+            hub_y = min(max(pad, hub_cy - hub_h / 2), H - hub_h - pad)
+        self.hub_rect = QRectF(hub_x, hub_y, hub_w, hub_h)
+
+        r1_x = int(hub_x + (hub_w - w1) / 2)
+        r1_y = int(hub_y)
+        qp.fillRect(QRectF(r1_x, r1_y, w1, h1), QColor(0, 0, 0, 220))
+        qp.drawImage(QPoint(r1_x, r1_y + pad // 2), row1)
+        char_w = 8 * ts
+        self.prev_rect = QRectF(r1_x, r1_y, char_w * 3, h1)
+        self.next_rect = QRectF(r1_x + w1 - char_w * 3, r1_y, char_w * 3, h1)
+
+        if row2 is not None:
+            r2_x = int(hub_x + (hub_w - w2) / 2)
+            r2_y = int(hub_y + h1 + GAP)
+            qp.drawImage(QPoint(r2_x, r2_y), row2)
+            r2_rect = QRectF(r2_x, r2_y, w2, h2)
+            if action_kind == "fire":
+                self.fire_rect = r2_rect
+            elif action_kind == "keep_best":
+                self.keep_best_rect = r2_rect
+            elif action_kind == "next_end":
+                self.next_rect = r2_rect
 
     # ------------------------------------------------------------ input
     def _hit(self, pt: QPointF) -> int:
@@ -388,6 +558,9 @@ class Review(QWidget):
 
     def wheelEvent(self, e):
         j = self._hit(e.position())
+        if j < 0 and self.rects:
+            j = min((k for k, r in enumerate(self.rects) if not r.isNull()),
+                    key=lambda k: (self.rects[k].center() - e.position()).manhattanLength(), default=-1)
         g = self.group
         if j < 0 or g is None:
             return
@@ -407,20 +580,50 @@ class Review(QWidget):
         self._clamp_center()
         self.update()
 
+    def _pan_btn(self):
+        return Qt.RightButton if self.pan == "right" else Qt.MiddleButton
+
+    def _blink_btn(self):
+        return Qt.MiddleButton if self.pan == "right" else Qt.RightButton
+
+    def _hit_kill(self, pt: QPointF) -> int:
+        for j, r in self.kill_rects.items():
+            if not r.isNull() and r.contains(pt):
+                return j
+        if not self.kill_rect.isNull() and self.kill_rect.contains(pt):
+            return self.kill_j
+        return -1
+
+    def _hit_only(self, pt: QPointF) -> int:
+        for j, r in self.only_rects.items():
+            if not r.isNull() and r.contains(pt):
+                return j
+        return -1
+
     def mousePressEvent(self, e):
         b = e.button()
-        if b == Qt.MiddleButton:
-            self._press, self._dragged = e.position(), False
+        pt = e.position()
+        if b == self._pan_btn():
+            self._press, self._dragged = pt, False
         elif b == Qt.LeftButton:
             g = self.group
-            if (g is not None and len(g.photos) > 1 and self.hover >= 0
-                    and getattr(self, "kill_rect", QRectF()).contains(e.position())):
-                self.kill_requested.emit(self.i, g.photos[self.kill_j].path)
-            elif getattr(self, "fire_rect", QRectF()).contains(e.position()):
+            kj = self._hit_kill(pt)
+            oj = self._hit_only(pt)
+            if g is not None and len(g.photos) > 1 and kj >= 0:
+                self.kill_requested.emit(self.i, g.photos[kj].path)
+            elif g is not None and len(g.photos) >= 3 and oj >= 0:
+                self.keep_only(oj)
+            elif not self.fire_rect.isNull() and self.fire_rect.contains(pt):
                 self.fire()
+            elif not self.keep_best_rect.isNull() and self.keep_best_rect.contains(pt):
+                self.keep_best()
+            elif not self.prev_rect.isNull() and self.prev_rect.contains(pt):
+                self.step(-1)
+            elif not self.next_rect.isNull() and self.next_rect.contains(pt):
+                self.step(1)
             else:
-                self.toggle(self._hit(e.position()))
-        elif b == Qt.RightButton:
+                self.toggle(self._hit(pt))
+        elif b == self._blink_btn():
             self.swap = 1
             self.update()
         elif b in (Qt.BackButton, Qt.ForwardButton):
@@ -444,14 +647,17 @@ class Review(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MiddleButton:
+        if e.button() == self._pan_btn():
             self._press = None
-        elif e.button() == Qt.RightButton:
+        elif e.button() == self._blink_btn():
             self.swap = 0
             self.update()
 
     def mouseDoubleClickEvent(self, e):
-        self.mousePressEvent(e)          # fast clicking just toggles again
+        pt = e.position()
+        if self._hit_kill(pt) >= 0:
+            return
+        self.mousePressEvent(e)          # fast clicking toggles or fires KEEP BEST -> DELETE
 
     def focusNextPrevChild(self, next_: bool) -> bool:
         return False                     # Tab belongs to the blink compare

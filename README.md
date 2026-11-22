@@ -21,14 +21,16 @@ Black and white, pixel font, keyboard and mouse driven. Windows. By **metamounta
 
 | Input | Action |
 |---|---|
-| Left click on an image | toggle delete cross |
-| Skull (top left of the image under the mouse) | remove this one image right away |
-| Del / Backspace / the `n X DELETE` button | remove the crossed-out images, next group |
+| Left click on an image | toggle delete cross (on 2-image pairs: clicking the other image swaps the cross in 1 click) |
+| Skull (at the inner seam corner of each image) | remove this one image right away |
+| `ONLY` (at the inner seam corner, 3+ images) | cross out all other images in the group |
+| `KEEP BEST` (central hub, 3+ images) | cross out all except the sharpest / highest-resolution `BEST` image |
+| Del / Backspace / central `n X DEL` button | remove the crossed-out images, next group |
+| Central `<` / `>` or Space, → / ← | previous / next group |
 | Mouse wheel | synchronous zoom, same spot in every image, pixel-exact from 100 % |
-| Middle drag | pan |
-| Hold right button | blink: every cell shows the next image |
+| Middle drag (or Right drag, configurable in `S`) | pan |
+| Hold right button (or Middle button) | blink: every cell shows the next image |
 | Tab / mouse side buttons | single image / switch |
-| Space, → / ← | next / previous group |
 | 0 | fit |
 | Ctrl+Z | undo |
 | Esc | one level back (double Esc on the start screen quits) |
