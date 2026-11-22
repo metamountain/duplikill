@@ -217,3 +217,13 @@ def test_central_switches_pair_and_six_grid_and_right_pan(app):
     assert r._press is not None and r.swap == 0
     r.mouseReleaseEvent(ev_right(QEvent.MouseButtonRelease))
     assert r._press is None
+
+
+def test_help_screen_f1(app):
+    from duplikill.app import HelpScreen
+    h = HelpScreen()
+    h.resize(1600, 950)
+    h._t_in = 0.0
+    pm = h.grab()
+    assert not pm.isNull() and len(h.lines()) == len(h.ITEMS)
+    assert all(len(line) == h.COLS for line in h.lines())

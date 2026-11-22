@@ -1,8 +1,7 @@
 """Overview for many groups: one clump per folder, its size = its number of images.
 
 Inside a clump every image is one pixel square; the squares of a group form a small block, and the blocks are
-packed from the middle outwards, so a clump looks organic. All in whole screen pixels - crisp, no scaling.
-The clumps are placed around the numbers in the middle.
+packed from the middle outwards, so a clump looks organic. The clumps are placed around the numbers in the middle.
 """
 from __future__ import annotations
 
@@ -59,8 +58,46 @@ class Clumps:
         self.packs = [pack_folder([len(groups[i].photos) for i in m], seed=k) if m else ([], (0, 0, 0, 0))
                       for k, m in enumerate(self.members)]
         self.u = 6
-        self.centre = np.zeros((n_folders, 2))
-        self.rects: list[tuple[int, int, int, int]] = [(0, 0, 0, 0)] * len(groups)   # per group, screen px
+        self.label_h = 0
+        self.label_w = [0] * n_folders
+        self.centre = np.zeros((n_folders, 2), float)
+        self.rects: list[tuple[float, float, int, int]] = [(0.0, 0.0, 0, 0)] * len(groups)
+
+        n_g = len(groups)
+        self.group_clump = np.array(folder_of, int) if n_g else np.zeros(0, int)
+        self.block_xy = np.zeros((n_g, 2), float)
+        self.block_cr = np.zeros((n_g, 2), int)
+        self.clump_mid = np.zeros((n_folders, 2), float)
+        self.clump_counts = np.ones(n_folders, float)
+        for k, m in enumerate(self.members):
+            if not m:
+                continue
+            blocks, (x0, y0, x1, y1) = self.packs[k]
+            self.clump_mid[k] = ((x1 + x0) / 2.0, (y1 + y0) / 2.0)
+            self.clump_counts[k] = float(len(m))
+            for gi, (bx, by, c, r) in zip(m, blocks):
+                self.block_xy[gi] = (bx, by)
+                self.block_cr[gi] = (c, r)
+        self._cols = self.block_cr[:, 0].tolist()
+        self._rows = self.block_cr[:, 1].tolist()
+        self.clump_phase = np.arange(n_folders, dtype=float) * 1.7
+        if n_g:
+            local = self.block_xy + self.block_cr * 0.5 - self.clump_mid[self.group_clump]
+            self.radial = np.hypot(local[:, 0], local[:, 1])
+            self.radial_dir = local / np.maximum(self.radial[:, None], 1e-6)
+            self.radial_dir[self.radial < 1e-6] = 0.0
+            self.radial_perp = np.stack([-self.radial_dir[:, 1], self.radial_dir[:, 0]], 1)
+            self.group_phase = (
+                self.clump_phase[self.group_clump]
+                + self.radial * 0.35
+                + np.arctan2(local[:, 1], local[:, 0]) * 0.35
+            )
+        else:
+            self.radial = np.zeros(0, float)
+            self.radial_dir = np.zeros((0, 2), float)
+            self.radial_perp = np.zeros((0, 2), float)
+            self.group_phase = np.zeros(0, float)
+        self.base_xy = np.zeros((n_g, 2), float)
 
     def layout(self, w: int, h: int, hole: tuple[int, int], label_h: int, label_w: list[int] | None = None):
         """Largest square pitch for which all clumps fit around the middle."""
@@ -68,9 +105,18 @@ class Clumps:
         for u in range(24, 2, -1):
             if self._place(w, h, hole, label_h, u):
                 self.u = u
+                self._update_base()
                 return
         self.u = 3
         self._place(w, h, hole, label_h, 3, force=True)
+        self._update_base()
+
+    def _update_base(self):
+        if len(self.groups):
+            self.base_xy = self.centre[self.group_clump] + (self.block_xy - self.clump_mid[self.group_clump]) * self.u
+            self.base_xy[:, 1] += self.label_h / 2.0
+        else:
+            self.base_xy = np.zeros((0, 2), float)
 
     def _place(self, w, h, hole, label_h, u, force=False) -> bool:
         cx, cy = w / 2, h / 2
@@ -91,7 +137,7 @@ class Clumps:
                 px, py = cx + math.cos(a) * rr * (w / h) ** 0.5, cy + math.sin(a) * rr / (w / h) ** 0.5
                 bx0, by0 = px - bw / 2, py - bh / 2
                 bx1, by1 = bx0 + bw, by0 + bh
-                if bx0 < margin or by0 < margin or bx1 > w - margin or by1 > h - margin:
+                if bx0 < margin or by0 < margin or bx1 > w - margin or by1 > h - margin - 32:
                     if rr > max(w, h):
                         break
                     continue
@@ -108,15 +154,23 @@ class Clumps:
         self.label_h = label_h
         return True
 
-    def group_rects(self, u: int, offsets: np.ndarray) -> list[tuple[int, int, int, int]]:
-        """Screen rectangle (x, y, cols, rows) of each group block for the current clump offsets."""
-        out = [(0, 0, 0, 0)] * len(self.groups)
-        for k, m in enumerate(self.members):
-            if not m:
-                continue
-            blocks, (x0, y0, x1, y1) = self.packs[k]
-            ox = int(round(self.centre[k][0] + offsets[k][0] - (x1 + x0) / 2 * u))
-            oy = int(round(self.centre[k][1] + offsets[k][1] - (y1 + y0) / 2 * u + self.label_h / 2))
-            for gi, (bx, by, c, r) in zip(m, blocks):
-                out[gi] = (ox + bx * u, oy + by * u, c, r)
-        return out
+    def group_positions(self, u: int, offsets: np.ndarray, group_offsets: np.ndarray | None = None) -> np.ndarray:
+        """Vectorized sub-pixel top-left position (x, y) per group for clump and individual offsets."""
+        if not len(self.groups):
+            return np.zeros((0, 2), float)
+        if u == self.u:
+            pos = self.base_xy + offsets[self.group_clump]
+        else:
+            pos = self.centre[self.group_clump] + (self.block_xy - self.clump_mid[self.group_clump]) * u
+            pos[:, 1] += self.label_h / 2.0
+            pos += offsets[self.group_clump]
+        if group_offsets is not None:
+            pos = pos + group_offsets
+        return pos
+
+    def group_rects(self, u: int, offsets: np.ndarray, group_offsets: np.ndarray | None = None) -> list[tuple[float, float, int, int]]:
+        """Screen rectangle (x, y, cols, rows) of each group block for current clump and group offsets."""
+        if not len(self.groups):
+            return []
+        pos = self.group_positions(u, offsets, group_offsets)
+        return list(zip(pos[:, 0].tolist(), pos[:, 1].tolist(), self._cols, self._rows))

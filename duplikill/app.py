@@ -186,11 +186,11 @@ class PixelButton(QWidget):
         par = self.parentWidget()
         self.setGeometry(3 * ts + x_cells * 8 * ts, par.height() - h - 3 * ts, w, h)
 
-    def place_bottom_right(self):
+    def place_bottom_right(self, x_cells: int = 0):
         ts = self.ts()
         w, h = len(self.text) * 8 * ts, 8 * ts
         par = self.parentWidget()
-        self.setGeometry(par.width() - w - 3 * ts, par.height() - h - 3 * ts, w, h)
+        self.setGeometry(par.width() - w - 3 * ts - x_cells * 8 * ts, par.height() - h - 3 * ts, w, h)
 
     def paintEvent(self, e):
         QPainter(self).drawImage(QPoint(0, 0), pixelfont.render([self.text], self.ts(), WHITE, QColor(0, 0, 0, 255)))
@@ -453,7 +453,7 @@ class SettingsScreen(PixelScreen):
             ("WHEEL=ZOOM  SPACE/ARROWS=GROUP  TAB=SOLO".ljust(self.COLS), GREY),
             (f"JOURNAL: {n_moved} MOVED ({human(b_moved)})  CFG: SETTINGS.JSON"[:self.COLS].ljust(self.COLS), GREY),
             ("", WHITE),
-            ("KEY 1-5 OR CLICK ROW: CHANGE    ESC: BACK".ljust(self.COLS), WHITE),
+            ("KEY 1-5 OR CLICK ROW: CHANGE    F1: HELP   ESC: BACK"[:self.COLS].ljust(self.COLS), WHITE),
         ]
         return out
 
@@ -504,6 +504,71 @@ class SettingsScreen(PixelScreen):
             self.cycle((line - 2) // 2 + 1)
 
 
+class HelpScreen(PixelScreen):
+    """Fixed-grid F1 help screen: full keyboard & mouse reference in white/grey pixel font."""
+    COLS = 52
+    N_LINES = 21
+
+    ITEMS = [
+        ("DUPLIKILL - HELP (F1)", WHITE),
+        ("", WHITE),
+        ("REVIEW (IMAGE COMPARE)", WHITE),
+        ("LEFT CLICK IMAGE     ", "TOGGLE DELETE CROSS (X)"),
+        ("SKULL (CENTER SEAM)  ", "REMOVE THIS ONE IMAGE AT ONCE"),
+        ("ONLY / KEEP BEST     ", "CROSS OUT ALL OTHER IMAGES"),
+        ("DEL / N X DEL BUTTON ", "REMOVE CROSSED & NEXT GROUP"),
+        ("MOUSE WHEEL / 0      ", "SYNC ZOOM AT CURSOR / FIT"),
+        ("MIDDLE / RIGHT MOUSE ", "DRAG = SYNC PAN, HOLD = BLINK"),
+        ("TAB / SIDE BUTTONS   ", "SOLO ONE IMAGE / FLIP NEXT"),
+        ("< > / SPACE / ARROWS ", "NEXT / PREVIOUS GROUP"),
+        ("CTRL+Z               ", "UNDO LAST MOVE (RESTORES)"),
+        ("", WHITE),
+        ("OVERVIEW & GENERAL", WHITE),
+        ("CLICK GROUP / WHEEL  ", "OPEN GROUP / ZOOM NET"),
+        ("STRICT <###..> LOOSE ", "LIVE SIMILARITY THRESHOLD"),
+        ("S / F11 / F1         ", "SETTINGS / FULLSCREEN / HELP"),
+        ("ESC (2X ON START)    ", "ONE STEP BACK (QUIT ON START)"),
+        ("", WHITE),
+        ("F1 / ESC / CLICK: BACK", WHITE),
+    ]
+
+    def lines(self) -> list[str]:
+        out = []
+        for item in self.ITEMS:
+            if isinstance(item[1], QColor):
+                out.append(item[0].ljust(self.COLS))
+            else:
+                out.append((item[0] + item[1])[:self.COLS].ljust(self.COLS))
+        return out
+
+    def paintEvent(self, e):
+        qp = QPainter(self)
+        bg = QLinearGradient(0, 0, 0, self.height())
+        bg.setColorAt(0, QColor(20, 20, 20))
+        bg.setColorAt(1, QColor(0, 0, 0))
+        qp.fillRect(self.rect(), bg)
+        ts = max(2, int(0.78 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
+        lh = 8 * ts
+        w = self.COLS * lh
+        h = len(self.ITEMS) * lh
+        x0 = (self.width() - w) // 2
+        y0 = (self.height() - h) // 2 + self._fly_offset()
+        for idx, item in enumerate(self.ITEMS):
+            y = y0 + idx * lh
+            if isinstance(item[1], QColor):
+                text, col = item
+                if text.strip():
+                    qp.drawImage(QPoint(x0, y), pixelfont.render([text.ljust(self.COLS)], ts, col))
+            else:
+                k_txt, desc = item
+                qp.drawImage(QPoint(x0, y), pixelfont.render([k_txt], ts, WHITE))
+                qp.drawImage(QPoint(x0 + len(k_txt) * lh, y),
+                             pixelfont.render([desc[:self.COLS - len(k_txt)].ljust(self.COLS - len(k_txt))], ts, GREY))
+        if int(time.time() * 2) % 2 == 0:
+            cur = pixelfont.render([" "], ts, WHITE, WHITE)
+            qp.drawImage(QPoint(x0, y0 + h), cur)
+
+
 class Main(QMainWindow):
     def __init__(self, dry_run: bool = False):
         super().__init__()
@@ -527,10 +592,14 @@ class Main(QMainWindow):
         self.search = SearchScreen()
         self.settings_screen = SettingsScreen(self.settings)
         self.settings_screen.changed.connect(self._setting_changed)
+        self.help_screen = HelpScreen()
+        self.help_screen.clicked.connect(self.close_help)
         self.stack.addWidget(self.start)
         self.stack.addWidget(self.search)
         self.stack.addWidget(self.settings_screen)
+        self.stack.addWidget(self.help_screen)
         self._settings_from = None
+        self._help_from = None
         self._delete_ok = False                  # 'delete forever' confirmed once per session
         self.start.clicked.connect(self.pick)
         self.start.intro_done.connect(self.pick)
@@ -547,6 +616,8 @@ class Main(QMainWindow):
         self.close_btn.hide()
         self.settings_btn = PixelButton(self.stack, "SETTINGS")
         self.settings_btn.clicked.connect(self.open_settings)
+        self.help_btn = PixelButton(self.stack, "F1 HELP")
+        self.help_btn.clicked.connect(self.open_help)
         self.fire_all_btn = PixelButton(self.stack, "")
         self.fire_all_btn.clicked.connect(self.fire_all)
         self.fire_all_btn.hide()
@@ -684,16 +755,26 @@ class Main(QMainWindow):
     DOUBLE_ESC = 0.45                                  # seconds
 
     def eventFilter(self, obj, e):
-        """Esc steps back screen by screen; only on the start screen does a double Esc quit."""
-        if e.type() == QEvent.KeyPress and e.key() == Qt.Key_Escape and not e.isAutoRepeat():
-            if self.stack.currentWidget() is not self.start:   # elsewhere Esc only steps back
-                self._last_esc = 0.0
-                return False
-            now = time.time()
-            if now - self._last_esc < self.DOUBLE_ESC:
-                self.close()
+        """F1 opens/closes help anywhere; Esc steps back screen by screen (double Esc on start quits)."""
+        if e.type() == QEvent.KeyPress and not e.isAutoRepeat():
+            if e.key() == Qt.Key_F1:
+                if self.stack.currentWidget() is self.help_screen:
+                    self.close_help()
+                elif self.stack.currentWidget() is not self.search:
+                    self.open_help()
                 return True
-            self._last_esc = now
+            if e.key() == Qt.Key_Escape:
+                if self.stack.currentWidget() is self.help_screen:
+                    self.close_help()
+                    return True
+                if self.stack.currentWidget() is not self.start:   # elsewhere Esc only steps back
+                    self._last_esc = 0.0
+                    return False
+                now = time.time()
+                if now - self._last_esc < self.DOUBLE_ESC:
+                    self.close()
+                    return True
+                self._last_esc = now
         return False
 
     def apply_window_mode(self):
@@ -719,6 +800,9 @@ class Main(QMainWindow):
                 self._answer("other")
             elif Qt.Key_1 <= k <= Qt.Key_9 and k - Qt.Key_1 < len(subs):
                 self._answer(k - Qt.Key_1)
+        elif cur is self.help_screen:
+            if k in (Qt.Key_Escape, Qt.Key_F1, Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+                self.close_help()
         elif cur is self.settings_screen:
             if k == Qt.Key_Escape:
                 self.close_settings()
@@ -728,6 +812,12 @@ class Main(QMainWindow):
             self.open_settings()
         elif k in (Qt.Key_Delete, Qt.Key_Backspace) and cur is self.nebula:
             self.fire_all()
+        elif k in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter) and cur is self.nebula and self.nebula is not None:
+            idx = next((i for i, a in enumerate(self.nebula.alive) if a), -1)
+            if idx >= 0:
+                self.open_group(idx)
+        elif cur is self.review and self.review is not None:
+            self.review.keyPressEvent(e)
         elif k == Qt.Key_Escape:                      # one level back; double Esc = quit (eventFilter)
             if cur is self.search:
                 self.cancel()
@@ -743,9 +833,10 @@ class Main(QMainWindow):
             return
         neb = getattr(self, "nebula", None)
         on = neb is not None and self.stack.currentWidget() is neb
+        right_w = len(self.settings_btn.text) + len(self.help_btn.text) + 3
         self.slider.setVisible(on)
         if on:
-            self.slider.place(len(self.open_btn.text) + len(self.close_btn.text) + 3, len(self.settings_btn.text))
+            self.slider.place(len(self.open_btn.text) + len(self.close_btn.text) + 3, right_w)
             self.slider.raise_()
         for b, x in ((self.open_btn, 0), (self.close_btn, len(self.open_btn.text) + 3)):
             b.setVisible(on)
@@ -753,23 +844,40 @@ class Main(QMainWindow):
                 b.place_bottom_left(x)
                 b.raise_()
         cur = self.stack.currentWidget()
-        self.settings_btn.setVisible(cur in (self.start, neb) and cur is not None)
-        if self.settings_btn.isVisible():
-            self.settings_btn.place_bottom_right()
+        show_corner = cur in (self.start, neb) and cur is not None
+        self.settings_btn.setVisible(show_corner)
+        self.help_btn.setVisible(show_corner)
+        if show_corner:
+            self.settings_btn.place_bottom_right(0)
             self.settings_btn.raise_()
+            self.help_btn.place_bottom_right(len(self.settings_btn.text) + 3)
+            self.help_btn.raise_()
         self._update_fire_all()
         (cur if cur is self.review else self).setFocus()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         if self.slider.isVisible():
-            self.slider.place(len(self.open_btn.text) + len(self.close_btn.text) + 3, len(self.settings_btn.text))
+            right_w = len(self.settings_btn.text) + len(self.help_btn.text) + 3
+            self.slider.place(len(self.open_btn.text) + len(self.close_btn.text) + 3, right_w)
         if self.open_btn.isVisible():
             self.open_btn.place_bottom_left(0)
             self.close_btn.place_bottom_left(len(self.open_btn.text) + 3)
         QTimer.singleShot(0, lambda: self._screen_changed(0))   # after the stack has its new size
 
-    # ------------------------------------------------------------ settings
+    # ------------------------------------------------------------ settings & help
+    def open_help(self):
+        cur = self.stack.currentWidget()
+        if cur is not self.help_screen:
+            self._help_from = cur
+            self.stack.setCurrentWidget(self.help_screen)
+
+    def close_help(self):
+        back = self._help_from if self._help_from is not None else self.start
+        if back is self.help_screen or back is None:
+            back = self.start
+        self.stack.setCurrentWidget(back)
+
     def open_settings(self):
         self._settings_from = self.stack.currentWidget()
         self.stack.setCurrentWidget(self.settings_screen)

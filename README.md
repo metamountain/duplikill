@@ -4,8 +4,6 @@ Thin out a big photo archive, fast. Duplikill finds duplicate and similar pictur
 
 Black and white, integer-scaled 8×8 C64 pixel font, keyboard and mouse driven. Windows. By **metamountain**.
 
-![logo](assets/duplikill.png)
-
 ---
 
 ## Screenshots & Workflow
@@ -59,6 +57,7 @@ Fixed-grid C64 menu with explanatory help lines under every setting, configurabl
 | `Ctrl+Z` | Undo last move (restores files + XMP sidecars and reopens the group) |
 | `Esc` | One level back (double `Esc` on the start screen quits) |
 | `S` | Open Settings (from start screen or overview) |
+| `F1` | Open / close Help overlay from any screen |
 | `Del` (in overview, `AT THE END` mode) | Remove all crossed-out images across all groups at once |
 | `F11` | Toggle borderless fullscreen / dark window |
 

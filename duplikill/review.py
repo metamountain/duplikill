@@ -151,15 +151,19 @@ class Review(QWidget):
                 self.thumbs.request(p.path, THUMB, priority=5 if k == self.i else 1)
         self.moved.emit(self.i)
 
-    def step(self, d: int):
+    def step(self, d: int, wrap: bool = False):
         """Next/previous group that is not done yet."""
         n = len(self.groups)
+        if not n:
+            return
         j = self.i
         for _ in range(n):
             j += d
             if not 0 <= j < n:
-                return
-            if self.groups[j].key not in self.done:
+                if not wrap:
+                    return
+                j %= n
+            if self.groups[j].key not in self.done and j != self.i:
                 self.show_group(j)
                 return
 
@@ -603,8 +607,11 @@ class Review(QWidget):
     def mousePressEvent(self, e):
         b = e.button()
         pt = e.position()
-        if b == self._pan_btn():
+        if b in (Qt.MiddleButton, Qt.RightButton):
             self._press, self._dragged = pt, False
+            if b == self._blink_btn():
+                self.swap = 1
+                self.update()
         elif b == Qt.LeftButton:
             g = self.group
             kj = self._hit_kill(pt)
@@ -618,14 +625,11 @@ class Review(QWidget):
             elif not self.keep_best_rect.isNull() and self.keep_best_rect.contains(pt):
                 self.keep_best()
             elif not self.prev_rect.isNull() and self.prev_rect.contains(pt):
-                self.step(-1)
+                self.step(-1, wrap=True)
             elif not self.next_rect.isNull() and self.next_rect.contains(pt):
-                self.step(1)
+                self.step(1, wrap=True)
             else:
                 self.toggle(self._hit(pt))
-        elif b == self._blink_btn():
-            self.swap = 1
-            self.update()
         elif b in (Qt.BackButton, Qt.ForwardButton):
             self.flip(-1 if b == Qt.BackButton else 1)
 
@@ -634,24 +638,34 @@ class Review(QWidget):
         if h != self.hover:
             self.hover = h
             self.update()                        # the skull follows the mouse
-        if self._press is None or self.hover < 0:
+        if self._press is None:
             return
         d = e.position() - self._press
+        if not self._dragged and d.manhattanLength() > 3:
+            self._dragged = True
+            if self.swap != 0:
+                self.swap = 0
         g = self.group
-        p = g.photos[self.hover]
+        if g is None or not self.rects:
+            return
+        cell_idx = self.hover if self.hover >= 0 and not self.rects[self.hover].isNull() else 0
+        if self.rects[cell_idx].isNull():
+            return
+        p = g.photos[cell_idx]
         iw, ih = self._dims(p, self._thumb(p.path))
-        s, _ = self._view(self.rects[self.hover], iw, ih)
+        s, _ = self._view(self.rects[cell_idx], iw, ih)
         self.center = (self.center[0] - d.x() / s / iw, self.center[1] - d.y() / s / ih)
         self._clamp_center()
         self._press = e.position()
         self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == self._pan_btn():
+        if e.button() in (Qt.MiddleButton, Qt.RightButton):
             self._press = None
-        elif e.button() == self._blink_btn():
-            self.swap = 0
-            self.update()
+            self._dragged = False
+            if self.swap != 0:
+                self.swap = 0
+                self.update()
 
     def mouseDoubleClickEvent(self, e):
         pt = e.position()
@@ -665,7 +679,7 @@ class Review(QWidget):
     def keyPressEvent(self, e):
         k = e.key()
         if k in (Qt.Key_Space, Qt.Key_Right, Qt.Key_Down, Qt.Key_PageDown):
-            self.step(-1 if e.modifiers() & Qt.ShiftModifier else 1)
+            self.step(-1 if e.modifiers() & Qt.ShiftModifier else 1, wrap=(k == Qt.Key_Space))
         elif k in (Qt.Key_Left, Qt.Key_Up, Qt.Key_PageUp):
             self.step(-1)
         elif k in (Qt.Key_Tab, Qt.Key_Backtab):
