@@ -1,6 +1,6 @@
 # Duplikill
 
-Thin out a big photo archive fast: exact copies go in one keypress per folder, similar shots are compared side
+Thin out a big photo archive or sereis of burst shots fast: zoom in and out ... similar shots are compared side
 by side, you cross out, and you move on.
 
 **[⬇ Duplikill-Setup.exe](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Setup.exe)** (installer) ·
