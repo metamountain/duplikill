@@ -21,7 +21,8 @@ def sidecars(path: str) -> list[str]:
     return out
 
 
-AUTO_FOLDER = "Duplikill"
+AUTO_FOLDER = "Duplikill-Bin"
+BIN_NAMES = {"duplikill-bin", "duplikill"}     # never scanned ("Duplikill" = name before 0.2.0)
 
 
 def auto_root(path: str) -> str:
@@ -91,6 +92,53 @@ class Mover:
         with open(self.journal, "w", encoding="utf-8") as fh:
             fh.writelines(lines[:-1])
         return entry
+
+    def _entries(self) -> list[dict]:
+        if not os.path.exists(self.journal):
+            return []
+        with open(self.journal, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def bin_items(self) -> list[dict]:
+        """Images (no sidecars) that were moved and are still in the bin, newest first:
+        {"src", "dst", "at", "group", "size"}. Deleted by hand in Explorer -> simply not listed."""
+        out = []
+        for e in self._entries():
+            for src, dst in e["moved"]:
+                if src.lower().endswith(".xmp"):
+                    continue
+                try:
+                    size = os.path.getsize(dst)
+                except OSError:
+                    continue
+                out.append({"src": src, "dst": dst, "at": e.get("at", 0), "group": e.get("group", ""), "size": size})
+        out.sort(key=lambda d: -d["at"])
+        return out
+
+    def restore(self, srcs: list[str]) -> list[str]:
+        """Moves these images (and their XMP sidecars) back to where they were; returns the restored paths."""
+        want = {os.path.normcase(s) for s in srcs}
+        stems = {os.path.splitext(s)[0] for s in want}
+        done, keep = [], []
+        for e in self._entries():
+            rest = []
+            for src, dst in e["moved"]:
+                k = os.path.normcase(src)
+                side = k.endswith(".xmp") and (k[:-4] in want or os.path.splitext(k[:-4])[0] in stems
+                                               or k[:-4] in stems)
+                if (k in want or side) and os.path.exists(dst) and not os.path.exists(src):
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    shutil.move(dst, src)
+                    if k in want:
+                        done.append(src)
+                else:
+                    rest.append([src, dst])
+            if rest:
+                e["moved"] = rest
+                keep.append(e)
+        with open(self.journal, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in keep)
+        return done
 
     def stats(self) -> tuple[int, int]:
         """(files moved, bytes moved) over the whole journal."""

@@ -1,103 +1,94 @@
 # Duplikill
 
-Thin out a big photo archive, **blazingly fast**. Duplikill scans thousands of high-res photos in seconds, finds duplicate and similar series with zero false-positive chains, shows every group **edge-to-edge on one screen**, you cross out what should go, fire, next group.
+Thin out a big photo archive fast. Duplikill finds duplicates and near-identical series, shows each group
+on one screen, you cross out what should go, and move on to the next group.
 
-### Why the Scan Engine Is So Fast
-
-- **Stage 1 — The [Czkawka](https://github.com/qarmin/czkawka) & [Krokiet](https://github.com/qarmin/czkawka/tree/master/krokiet) Rust Scan Engine (by Rafał Mikrut / [@qarmin](https://github.com/qarmin)):** All credit for the raw Stage-1 file & image-hashing engine goes to **Rafał Mikrut**, the inventor of **Czkawka** and its modern frontend **Krokiet**. His multi-threaded Rust scanner is an absolute beast — tearing through uncached folders at ~80–400 images/s and re-scanning cached archives (`> 1,000 images/s`) in a split second. Duplikill shares `%LOCALAPPDATA%\Qarmin\Czkawka\cache` directly with Krokiet, so any folder Krokiet has ever scanned opens almost instantaneously.
-- **Stage 2 — Vectorized 2-Pass Verification & Series Merger (`~0.14 s` for 400 groups / 2,400 photos):** Fast 8×8 hashes alone can group unrelated lookalikes or split long burst series. Duplikill decodes 1/8-scale JPEG drafts across all CPU cores, computes 24×24 greyscale structure correlation (`≥ 0.6`), 4×4 colour distance (`≤ 0.12`), 2D Laplacian sharpness, and EXIF capture timestamps (`DateTimeOriginal`), then runs a **two-pass vectorized agglomerative verifier**:
-  1. **Pass 1 (`refine`):** Splits out false lookalikes using average linkage with a strict floor (no transitive A→B→C chaining).
-  2. **Pass 2 (`merge`):** Re-unites burst series that Stage 1 split across multiple groups (`≤ 15 min`), backed by a versioned cluster-state cache and chunked SQLite signature storage (`~20 ms` to load 3,000 signatures).
-- **CUDA + Multi-Core Engine (`index.py` / `groups.py`):** Includes a hybrid CPU/GPU pipeline where multi-core processes decode 1/8-scale greyscale drafts ahead of the GPU while `torch.cuda` computes 64-bit DCT perceptual hashes, Laplacian sharpness, and 4096×4096 LUT-popcount Hamming distance matrices in batches of 256.
-
-Black and white, integer-scaled 8×8 C64 pixel font, 60 FPS spring-reverb overview, keyboard and mouse driven. Windows. By **metamountain**.
-
----
-
-## Download & Install (Windows 10/11 64-bit)
-
-No Python, no manual dependencies required — `windows_czkawka_cli.exe` and the C64 pixel font are bundled inside:
-
-- **[⬇ Download `Duplikill-Setup.exe` (70 MB — 1-Click Windows Installer)](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Setup.exe)** — installs to `%LOCALAPPDATA%\Programs\Duplikill`, creates Start Menu & Desktop shortcuts, and launches Duplikill.
-- **[⬇ Download `Duplikill-Portable-win64.zip` (70 MB — Portable ZIP)](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Portable-win64.zip)** — unpack anywhere and run `Duplikill.exe`.
-
----
-
-## Screenshots & Workflow
-
-### 1. Overview (Floating Net & Folder Clumps)
-Few groups float as a live physics net of real thumbnails joined by folder lines; large archives switch automatically to organic pixel clumps (one square per photo, well above 30 fps). The similarity slider (`STRICT <######......> LOOSE`) re-queries the cache in a fraction of a second.
+**[⬇ Duplikill-Setup.exe](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Setup.exe)** (installer) ·
+**[⬇ Portable ZIP](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Portable-win64.zip)** ·
+Windows 10/11, 64-bit, no Python needed.
 
 ![Overview](assets/overview.svg)
 
-### 2. Review (Edge-to-Edge Compare with Central Seam Switches)
-Every group fills the screen edge to edge (`2 px` seam). All action switches cluster right around the **central seam `(W/2, H/2)`** so mouse travel stays minimal (~45 px) and photo centers (faces/subjects) are never covered:
-- **2-image pairs:** Both `[☠]` instant-remove switches sit left and right of the vertical center seam directly above the `< i/N >` hub. Clicking one photo sets an `X`; clicking the other swaps the `X` in 1 click.
-- **Multi-image groups & bursts (e.g. 6 photos):** Each cell has `[ONLY] [☠]` at its inner seam corner. Click any subset of photos to cross them out (e.g. keep 3 of 6), or click `[ONLY]` / `[KEEP BEST]` to cross out all others in 1 click, then fire `[🗑 n X DEL]` right at the center.
+## Fast scan
+
+- **Stage 1: [Czkawka](https://github.com/qarmin/czkawka)** by Rafał Mikrut ([@qarmin](https://github.com/qarmin)), the Rust
+  engine behind Krokiet. It hashes about 80 new photos per second (4,108 photos from 2011: 53 s). Images it has
+  already seen come from its cache: the same folder again takes about 4 s. The cache is shared with an installed
+  Krokiet.
+- **Stage 2: verification.** Fast hashes sometimes put unrelated images together, or split one long series. Duplikill
+  checks every pair for structure, colour and capture date. A group is kept only if every image matches every other
+  one (no A→B→C chains), and series split by stage 1 are joined again. 400 groups / 2,400 photos: 0.14 s.
+- **Results are saved.** Reopen a folder and the groups, your crosses and your position are back at once. Duplikill
+  only rescans if images were added, changed or removed in the meantime.
+- **Big folders:** scans longer than about 90 s are announced first. You can pick a subfolder (click or 1–9), or exclude
+  one (right click / Shift+1–9).
+- **Similarity slider** (`STRICT … LOOSE`) in the overview: changing it searches again in a fraction of a second.
+
+## Fast comparison
 
 ![Review](assets/review.svg)
 
-### 3. Settings (`S`)
-Fixed-grid C64 menu with explanatory help lines under every setting, configurable mouse pan (`MIDDLE BUTTON` vs `RIGHT BUTTON`), live journal statistics, and JSON configuration (`%LOCALAPPDATA%\Duplikill\settings.json`).
+- **The whole group fits on one screen**, edge to edge.
+- **Synchronous zoom:** the mouse wheel zooms every image of the group into the same spot (e.g. the eyes of a
+  portrait). From 100 % on, the originals are shown **pixel for pixel**, so you can see blur and noise.
+- **Blink:** hold the right mouse button and every image shows its neighbour at the same zoom and spot.
+- **BEST** blinks on the sharpest full-size image. `KEEP BEST` crosses out all the others.
+- **Click = cross, Del = remove crossed and go to the next group.** The skull removes a single image at once.
+  `Ctrl+Z` brings back the last group.
 
-![Settings](assets/settings.png)
+## Removing is safe
 
----
+- By default files are **moved**, not deleted, into one bin per drive: `<drive>:\Duplikill-Bin\<original path>`
+  (instant, no copying; XMP sidecars go along). It is a normal folder: look at it in Explorer, delete it when you are
+  sure. Windows' recycle bin and permanent delete can be chosen in the settings, but the recycle bin has a size limit
+  (beyond it Windows deletes for good) and none on network drives.
+- **Get single images back:** `B` opens the BIN view, all removed images as thumbnails, newest first. Click the ones
+  you want and press `R`: they go back to where they were, also days later. `Ctrl+Z` undoes the last delete.
+- At least one image of every group always stays. Nothing is removed without your click.
 
-## How It Works
+## Best-of folders and exclusions
 
-1. **Open a folder.** Scans estimated over 90 seconds show a warning with the cached percentage and a 1–9 shortcut list of the largest subfolders.
-2. **Two-stage ultra-fast search:**
-   - **Stage 1 — [Czkawka](https://github.com/qarmin/czkawka) / [Krokiet](https://github.com/qarmin/czkawka/tree/master/krokiet) Rust engine (`@qarmin`):** Multi-threaded 8×8 gradient hashing tears through uncached folders at ~80–400 images/s and re-queries cached archives (`> 1,000 images/s`) in a split second. Shares `%LOCALAPPDATA%\Qarmin\Czkawka\cache` directly with an installed **Krokiet** / **Czkawka**, so anything Krokiet has hashed is instant in Duplikill too.
-   - **Stage 2 — Vectorized `verify.py` refinement (`~0.14 s` for 400 groups / 2,400 photos):** Re-verifies every candidate pair via 24×24 greyscale structure correlation (`≥ 0.6`), 4×4 colour layout distance (`≤ 0.12`), Laplacian sharpness, and EXIF capture date (`DateTimeOriginal`). Rebuilds groups with average linkage + floor (eliminating false lookalikes and transitive chaining) and merges burst series split by Stage 1 (`≤ 15 min`). Signatures are batch-cached in `%LOCALAPPDATA%\Duplikill\signatures.sqlite` (`~20 ms` for 3,000 rows).
-3. **Safe removal & undo:**
-   - By default, **removing means moving**: files (plus `.xmp` sidecars) move instantaneously to `<Drive>:\Duplikill\<original path>` on the same drive (no byte copying), logged in `journal.jsonl`, and can be undone anytime with `Ctrl+Z`.
-   - In Settings (`S`), you can switch the move target to `<Scanned Folder>\Duplikill\<path>` or a custom folder, or switch removal to the Windows Recycle Bin or permanent deletion (asked once per session).
+Do you collect your favourites as copies in a "best of" folder? Duplikill notices folders whose images mostly exist
+elsewhere and asks once: exclude it (those duplicates are on purpose) or keep scanning it. Excluded folders can also
+be managed in the settings (`S`).
 
----
-
-## Controls (Review)
+## Controls
 
 | Input | Action |
 |---|---|
-| Left click on an image | Toggle delete cross `X` (on 2-image pairs: clicking the other image swaps the cross in 1 click) |
-| Skull `[☠]` (inner seam corner of each image) | Remove this one image immediately |
-| `[ONLY]` (inner seam corner, 3+ images) | Cross out all other images in the group (click another photo to keep 2 or 3) |
-| `[KEEP BEST]` (central hub, 3+ images) | Cross out all except the sharpest / highest-resolution `BEST` image |
-| `Del` / `Backspace` / central `[🗑 n X DEL]` | Remove crossed-out images and advance to the next group |
-| Central `<` / `>` or `Space`, `→` / `←` | Previous / next group |
-| Mouse wheel | Synchronous zoom into the cursor spot across all images (pixel-exact from 100 %) |
-| Middle drag (or Right drag, configurable in `S`) | Synchronous pan across all images |
-| Hold Right button (or Middle button) | Blink compare: every cell shows the next image at the exact same zoom & spot |
-| `Tab` / mouse side buttons | Solo single image / cycle to next |
-| `0` / `Home` | Reset zoom to fit |
-| `Ctrl+Z` | Undo last move (restores files + XMP sidecars and reopens the group) |
-| `Esc` | One level back (double `Esc` on the start screen quits) |
-| `S` | Open Settings (from start screen or overview) |
-| `F1` | Open / close Help overlay from any screen |
-| `Del` (in overview, `AT THE END` mode) | Remove all crossed-out images across all groups at once |
-| `F11` | Toggle borderless fullscreen / dark window |
+| Click image | cross / uncross |
+| `Del` / `Backspace` | remove crossed, next group |
+| Skull on an image | remove just this image now |
+| `KEEP BEST` / `ONLY` | cross out all but the best / all but this one |
+| Mouse wheel · `0` | synchronous zoom at the cursor · fit |
+| Middle drag · hold right | pan · blink compare (swappable in settings) |
+| `Space` `→` / `←` | next / previous group |
+| `Tab` | one image alone, again = next one |
+| `Ctrl+Z` | undo |
+| `Esc` | one step back |
+| `S` · `F1` · `F11` | settings · help · fullscreen |
+| `B` | bin: see removed images, restore single ones (`R`) |
+| `U` | install an update (shown when GitHub has a newer version) |
+| `F8` | report a bug |
 
-At least one image of a group always stays. Nothing is ever removed automatically.
+## Privacy
 
----
+Duplikill sends nothing by itself. At startup it asks GitHub whether there is a newer release. `F8` (bug report) and
+"share numbers" in the settings open a prefilled GitHub issue in your browser with folder paths removed. You read it
+and decide whether to submit it. Statistics (images removed, space freed) stay on your computer.
 
-## Build from Source (Developers)
-
-Requires Python 3.14 and Windows 10/11. `tools\build_exe.py` automatically downloads `windows_czkawka_cli.exe` 12.0.2 if not present, builds `dist\Duplikill\Duplikill.exe`, and packages both `dist\Duplikill-Portable-win64.zip` and `dist\Duplikill-Setup.exe`:
+## Build from source
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python -I tools\build_exe.py          # builds Exe + Portable ZIP + Setup.exe
-.venv\Scripts\python -I -m duplikill --dry-run      # run from source without touching files
-.venv\Scripts\python -I -m pytest -q tests          # run test suite
+.venv\Scripts\python -I tools\build_exe.py          # exe + portable ZIP + Setup.exe
+.venv\Scripts\python -I -m duplikill --dry-run      # run without touching any file
+.venv\Scripts\python -I -m pytest -q tests
 ```
 
----
+## Credits & license
 
-## Credits & License
-
-- **Huge shout-out to Rafał Mikrut ([@qarmin](https://github.com/qarmin))**, the creator of **[Czkawka](https://github.com/qarmin/czkawka)** and **[Krokiet](https://github.com/qarmin/czkawka/tree/master/krokiet)** (MIT) — his uncompromisingly fast multi-threaded Rust scanner and shared cache architecture make Duplikill's raw scan speed possible.
-- [C64 font](https://github.com/zeiche/c64font) (CC0), see `tools/fonts/LICENSE-c64font.md`.
-- Licensed under the [MIT License](LICENSE).
+- [Czkawka / Krokiet](https://github.com/qarmin/czkawka) by Rafał Mikrut (MIT): the scan engine.
+- Pixel font: [c64font](https://github.com/zeiche/c64font) (CC0).
+- Duplikill: [MIT License](LICENSE).

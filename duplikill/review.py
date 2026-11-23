@@ -12,10 +12,11 @@ Ctrl+Z = undo (handled by the window)
 from __future__ import annotations
 
 import os
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
@@ -26,6 +27,7 @@ from .index import human, register_heif
 register_heif()
 
 THUMB = 560
+BLINK = 1.0                               # seconds on, seconds off: the BEST label blinks slowly
 WHITE = QColor(255, 255, 255)
 GREY = QColor(150, 150, 150)
 BLACK_BG = QColor(0, 0, 0, 200)
@@ -60,7 +62,27 @@ def cells(n: int, w: int, h: int) -> list[QRectF]:
 
 
 class _Loaded(QObject):
-    done = Signal(str, QImage)
+    done = Signal(str, object)             # path, [original, 1/2, 1/4, ...] (mip levels)
+
+
+MIP_MIN = 400                            # smallest level width
+
+
+def mips(img: QImage) -> list[QImage]:
+    """Original plus halves: shrinking from the next bigger level keeps the preview smooth (no jaggies)."""
+    out = [img]
+    while not img.isNull() and img.width() // 2 >= MIP_MIN:
+        img = img.scaled(img.width() // 2, img.height() // 2, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        out.append(img)
+    return out
+
+
+def pick_level(levels: list[QImage], width: float) -> QImage:
+    """Smallest level that is still at least as wide as it is drawn."""
+    for lv in reversed(levels):
+        if lv.width() >= width:
+            return lv
+    return levels[0]
 
 
 _POOL = ThreadPoolExecutor(max_workers=4)
@@ -121,6 +143,7 @@ class Review(QWidget):
         self.rects: list[QRectF] = []
         self.pix: dict[str, QPixmap] = {}
         self.full: dict[str, QImage] = {}              # originals of the current group, loaded on zoom
+        self.levels: dict[str, list[QImage]] = {}      # their mip levels (original first)
         self._loading: set[str] = set()
         self._loaded = _Loaded()
         self._loaded.done.connect(self._full_ready)
@@ -130,6 +153,36 @@ class Review(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_OpaquePaintEvent)
         thumbs.ready.connect(self._ready)
+        self._blink = QTimer(self, interval=int(BLINK * 1000), timeout=self._blink_tick)
+        self._blink.start()
+        self.hint_until = 0.0
+        self._hint_timer = QTimer(self, interval=60, timeout=self._hint_tick)
+
+    HINT = ["CLICK IMAGE: CROSS IT", "DEL / BACKSPACE: DELETE", "SPACE / DOWN: NEXT GROUP", "UP: PREVIOUS GROUP"]
+    HINT_SECONDS = 1.6
+
+    def show_hint(self):
+        """New users: the core keys blink big in the middle for a moment."""
+        self.hint_until = time.time() + self.HINT_SECONDS
+        self._hint_timer.start()
+
+    def _hint_tick(self):
+        if time.time() > self.hint_until:
+            self._hint_timer.stop()
+        self.update()
+
+    def _draw_hint(self, qp: QPainter, ts: int):
+        if time.time() > self.hint_until or int(time.time() * 4) % 2:       # blinks 2x per second
+            return
+        img = pixelfont.render(self.HINT, 2 * ts, WHITE, QColor(0, 0, 0, 235))
+        pad = 4 * ts
+        x, y = (self.width() - img.width()) // 2, (self.height() - img.height()) // 2
+        qp.fillRect(x - pad, y - pad, img.width() + 2 * pad, img.height() + 2 * pad, QColor(0, 0, 0, 235))
+        qp.drawImage(QPoint(x, y), img)
+
+    def _blink_tick(self):
+        if self.isVisible() and self.group is not None and len(self.group.photos) > 1:
+            self.update()
 
     # ------------------------------------------------------------ state
     @property
@@ -151,6 +204,7 @@ class Review(QWidget):
         self.solo = None
         self.hover = -1
         self.full.clear()
+        self.levels.clear()
         self.pix.clear()                    # only the current group's pixmaps stay in memory
         self.reset_view()
         for k in range(self.i, min(len(self.groups), self.i + 4)):     # preload ahead
@@ -263,27 +317,31 @@ class Review(QWidget):
     def _original(self, path: str) -> QImage | None:
         """The original, if loaded; otherwise it is loaded in the background (thumbnail shown meanwhile)."""
         img = self.full.get(path)
-        if img is None and path not in self._loading:
+        if img is not None:
+            return None if img.isNull() else self.levels.get(path, [img])
+        if path not in self._loading:
             self._loading.add(path)
             sig = self._loaded.done
             n = len(self.group.photos) if self.group else 1
-            budget = FULL_BUDGET // 4 // max(1, n)           # pixels per image (4 bytes each)
+            budget = FULL_BUDGET * 3 // 4 // 4 // max(1, n)  # pixels per image (4 bytes each, + 1/3 for the mips)
 
             def _task():
                 decoded = _read(path, budget)
                 try:
-                    sig.emit(path, decoded)
+                    sig.emit(path, mips(decoded))
                 except RuntimeError:
                     pass
 
             _POOL.submit(_task)
-        return None if img is None or img.isNull() else img
+        return None
 
-    def _full_ready(self, path: str, img: QImage):
+    def _full_ready(self, path: str, levels: list):
+        img = levels[0]
         self._loading.discard(path)
         g = self.group
         if g and any(p.path == path for p in g.photos):      # still the same group
             self.full[path] = img
+            self.levels[path] = levels
             self.update()
 
     def _dims(self, p, thumb: QPixmap | None) -> tuple[float, float]:
@@ -379,10 +437,11 @@ class Review(QWidget):
             img_rect = QRectF(cell.center().x() - iw * s / 2 + (0.5 - self.center[0]) * iw * s,
                               cell.center().y() - ih * s / 2 + (0.5 - self.center[1]) * ih * s, iw * s, ih * s)
             need_full = thumb is None or s * iw > thumb.width() * 1.05
-            orig = self._original(p.path) if need_full and self.zoom > 1.0 else None
-            if orig is not None:
-                qp.setRenderHint(QPainter.SmoothPixmapTransform, s < 1.0)
-                qp.drawImage(img_rect, orig, QRectF(orig.rect()))
+            levels = self._original(p.path) if need_full else None
+            if levels is not None:
+                lv = pick_level(levels, iw * s * self.devicePixelRatioF())
+                qp.setRenderHint(QPainter.SmoothPixmapTransform, s < 1.0)    # from 100 %: real pixels
+                qp.drawImage(img_rect, lv, QRectF(lv.rect()))
             elif thumb is not None:
                 qp.setRenderHint(QPainter.SmoothPixmapTransform, True)
                 qp.drawPixmap(img_rect, thumb, QRectF(thumb.rect()))
@@ -390,7 +449,7 @@ class Review(QWidget):
                 self._cross(qp, img_rect.intersected(cell))
             folder = os.path.basename(os.path.dirname(p.path))
             zoom_txt = f"   {s * 100:.0f} %" if self.zoom > 1.0 else ""
-            best_txt = "BEST  " if j == g.best else ""
+            best_txt = ("BEST  " if int(time.time() / BLINK) % 2 == 0 else "      ") if j == g.best else ""
             cap = pixelfont.render([f"{best_txt}{int(iw)}X{int(ih)}  {human(p.size)}{zoom_txt}", folder],
                                    ts, GREY if j in m else WHITE, BLACK_BG)
             top_row = len(vis) > cols_vis and cell.center().y() < self.height() / 2
@@ -400,6 +459,7 @@ class Review(QWidget):
         self._status(qp, g, ts, vis)
         if self.swap == 0 and len(g.photos) > 1 and len(vis) > 1:
             self._draw_cell_switches(qp, g, ts, vis, rects)
+        self._draw_hint(qp, ts)                         # on top of everything
 
     def _cross(self, qp: QPainter, rect: QRectF):
         """Image dimmed, a big X over it in thin white lines."""

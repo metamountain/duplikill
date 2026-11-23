@@ -225,5 +225,6 @@ def test_help_screen_f1(app):
     h.resize(1600, 950)
     h._t_in = 0.0
     pm = h.grab()
-    assert not pm.isNull() and len(h.lines()) == len(h.ITEMS)
+    assert not pm.isNull() and len(h.lines()) == len(h.CORE) + len(h.ITEMS)
+    assert all(len(c) <= h.COLS // 2 for c in h.CORE)        # double size must fit
     assert all(len(line) == h.COLS for line in h.lines())

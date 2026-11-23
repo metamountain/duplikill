@@ -39,7 +39,7 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Duplikill Setup")]
 [assembly: AssemblyProduct("Duplikill")]
-[assembly: AssemblyVersion("0.1.0.0")]
+[assembly: AssemblyVersion("0.2.0.0")]
 
 class SetupForm : Form {
     TextBox pathBox;
@@ -259,7 +259,7 @@ class SetupForm : Form {
                 "start /b \"\" cmd /c \"ping 127.0.0.1 -n 2 >nul & rmdir /s /q \"" + targetDir + "\"\"\r\n");
             using (RegistryKey k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\Duplikill")) {
                 k.SetValue("DisplayName", "Duplikill");
-                k.SetValue("DisplayVersion", "0.1.0");
+                k.SetValue("DisplayVersion", "0.2.0");
                 k.SetValue("Publisher", "metamountain");
                 k.SetValue("DisplayIcon", exePath);
                 k.SetValue("InstallLocation", targetDir);

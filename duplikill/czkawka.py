@@ -21,6 +21,7 @@ from .index import Photo, data_dir
 # extensions czkawka's image tool reads (without -x); used only for counting
 IMAGE_EXT = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp",
              ".heic", ".heif", ".avif", ".jxl", ".ico", ".tga", ".pnm", ".qoi", ".dds", ".hdr", ".exr"}
+_BIN = {"duplikill", "duplikill-bin"}  # our own bin folders (lower case), never part of a result
 MIN_SIZE = 16384                       # czkawka default -m
 SPEED_UNCACHED = 4108 / 53             # images/s, measured on a 4108-image folder
 SPEED_CACHED = 4108 / 4                # rough; cached runs only compare hashes
@@ -74,7 +75,7 @@ def list_images(root: str, excluded: list[str] | None = None, stop: threading.Ev
                 for e in it:
                     try:
                         if e.is_dir(follow_symlinks=False):
-                            if (not ex or not _excluded(e.path, ex)) and e.name.lower() not in ("$recycle.bin", "duplikill"):
+                            if (not ex or not _excluded(e.path, ex)) and e.name.lower() not in ("$recycle.bin", "duplikill", "duplikill-bin"):
                                 stack.append(e.path)
                         elif os.path.splitext(e.name)[1].lower() in IMAGE_EXT and e.stat().st_size >= MIN_SIZE:
                             out.append(e.path)
@@ -166,7 +167,7 @@ def parse(json_path: str) -> list[Group]:
         for it in items:
             raw_path = it["path"]
             norm_raw = os.path.normcase(raw_path)
-            if "duplikill" in norm_raw.split(os.sep)[:-1]:
+            if _BIN & set(norm_raw.split(os.sep)[:-1]):
                 continue
             dn, fn = os.path.dirname(raw_path), os.path.basename(raw_path)
             dk = os.path.normcase(dn)
@@ -195,7 +196,7 @@ def parse(json_path: str) -> list[Group]:
                 except OSError:
                     continue
             np_ = os.path.normcase(p)
-            if np_ in seen or "duplikill" in np_.split(os.sep)[:-1]:
+            if np_ in seen or _BIN & set(np_.split(os.sep)[:-1]):
                 continue
             seen.add(np_)
             photos.append(Photo(path=p, size=it.get("size", 0), mtime=float(it.get("modified_date", 0)),

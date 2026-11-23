@@ -5,6 +5,7 @@ Run: .venv\\Scripts\\python.exe -I tools\\make_icon.py
 """
 import math
 import os
+import sys
 
 import numpy as np
 from PIL import Image
@@ -61,12 +62,17 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = os.path.join(root, "assets")
     os.makedirs(out, exist_ok=True)
+    png = os.path.join(out, "duplikill.png")
+    sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]
+    if os.path.exists(png) and "--force" not in sys.argv:   # the PNG was hand-edited: only rebuild the .ico
+        Image.open(png).convert("RGBA").save(os.path.join(out, "duplikill.ico"), sizes=sizes)
+        print("duplikill.ico rebuilt from the existing duplikill.png (--force draws a new PNG)")
+        return
     bm = bitmap()
     img = Image.fromarray(np.where(bm, 255, 0).astype("uint8"), "L").convert("RGBA")
     big = img.resize((256, 256), Image.NEAREST)          # whole-number scaling only
-    big.save(os.path.join(out, "duplikill.png"))
-    big.save(os.path.join(out, "duplikill.ico"),
-             sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+    big.save(png)
+    big.save(os.path.join(out, "duplikill.ico"), sizes=sizes)
     ys, xs = np.nonzero(bm)
     print("Rand oben/unten/links/rechts:", ys.min(), N - 1 - ys.max(), xs.min(), N - 1 - xs.max())
 

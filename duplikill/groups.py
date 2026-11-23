@@ -49,7 +49,10 @@ def pick_best(g: Group) -> int:
             return (-bool(COPY_HINT.search(name)), -len(p.path), -p.mtime)
         if g.kind == "burst":
             return (p.sharp, p.pixels)
-        return (np.log1p(p.pixels) + 1.5 * np.log1p(p.sharp), p.size)
+        # a smaller copy is never best; among full-size ones the sharpest (1024-px Laplacian) wins
+        full = p.pixels >= 0.9 * top
+        return (full, round(p.sharp, -1), -bool(COPY_HINT.search(os.path.basename(p.path))), p.pixels, p.size)
+    top = max((p.pixels for p in g.photos), default=0)
     return max(range(len(g.photos)), key=lambda i: score(g.photos[i]))
 
 

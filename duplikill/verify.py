@@ -40,15 +40,19 @@ class Sig:
         self.grey, self.colour, self.taken, self.sharp = grey, colour, taken, float(sharp or 0.0)
 
 
+SHARP_SIDE = 1024
+TABLE = "sig2"          # v2: sharpness at 1024 px (v1 rows had sharp = 0 from a late ALTER TABLE)
+
+
 def signature(path: str) -> Sig | None:
     from PIL import Image, ImageOps
     try:
         with Image.open(path) as im:
             _, _, taken, _ = exif_info(im)
-            im.draft("RGB", (256, 256))
+            im.draft("RGB", (SHARP_SIDE, SHARP_SIDE))
             im = ImageOps.exif_transpose(im.convert("RGB"))
             small = np.asarray(im.resize((24, 24), Image.BILINEAR), np.float32) / 255
-            im.thumbnail((256, 256))
+            im.thumbnail((SHARP_SIDE, SHARP_SIDE))     # blur of a few pixels vanishes at 256 px, not at 1024
             sharp = sharpness(np.asarray(im.convert("L")))
     except Exception:
         return None
@@ -84,12 +88,10 @@ class SigCache:
         con = sqlite3.connect(self.db_path)
         if not self._schema_ready:
             con.execute(
-                "CREATE TABLE IF NOT EXISTS sig (path TEXT, size INTEGER, mtime REAL, grey BLOB, colour BLOB,"
+                f"CREATE TABLE IF NOT EXISTS {TABLE} (path TEXT, size INTEGER, mtime REAL, grey BLOB, colour BLOB,"
                 " taken REAL, sharp REAL DEFAULT 0.0, PRIMARY KEY (path, size, mtime))"
             )
-            cols = {r[1] for r in con.execute("PRAGMA table_info(sig)")}
-            if "sharp" not in cols:
-                con.execute("ALTER TABLE sig ADD COLUMN sharp REAL DEFAULT 0.0")
+            con.execute("DROP TABLE IF EXISTS sig")
             con.commit()
             self._schema_ready = True
         return con
@@ -104,7 +106,7 @@ class SigCache:
                 for i in range(0, len(paths), _DB_CHUNK):
                     chunk = paths[i:i + _DB_CHUNK]
                     q = ",".join("?" * len(chunk))
-                    sql = f"SELECT path, size, mtime, grey, colour, taken, sharp FROM sig WHERE path IN ({q})"
+                    sql = f"SELECT path, size, mtime, grey, colour, taken, sharp FROM {TABLE} WHERE path IN ({q})"
                     for p, sz, mt, grey, colour, taken, sharp in con.execute(sql, chunk):
                         k = (p, sz, mt)
                         if k in wanted:
@@ -123,7 +125,7 @@ class SigCache:
         try:
             with closing(self._db()) as con, con:
                 con.executemany(
-                    "INSERT OR REPLACE INTO sig VALUES (?,?,?,?,?,?,?)",
+                    f"INSERT OR REPLACE INTO {TABLE} VALUES (?,?,?,?,?,?,?)",
                     [(*k,
                       None if s is None else s.grey.astype(np.float32).tobytes(),
                       None if s is None else s.colour.astype(np.float32).tobytes(),

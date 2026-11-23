@@ -13,8 +13,9 @@ from PySide6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QShortcut
 from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QStackedWidget, QWidget
 
-from . import czkawka, pixelfont, verify
+from . import __version__, czkawka, pixelfont, report, session, verify
 from .actions import Mover
+from .binview import BinView
 from .index import data_dir, human
 from .nebula import Nebula
 from .review import AT_END, PER_GROUP, Review
@@ -26,7 +27,9 @@ DEFAULTS = {"action": "move",          # move | trash | delete
             "target_mode": "central",  # central: <drive>\\Duplikill\\<path> | folder: <scan>\\Duplikill\\<path> | custom
             "target": "",              # the folder for target_mode custom
             "fire": PER_GROUP, "pan": "middle", "max_diff": 12, "hash_size": 8,
-            "last_root": "", "window": "fullscreen"}         # window: fullscreen | window
+            "last_root": "", "window": "fullscreen",         # window: fullscreen | window
+            "excluded": [],            # folders never scanned (settings, big-folder screen, best-of question)
+            "bestof_kept": []}         # looked like best-of folders, the user wants them scanned anyway
 SLIDER_MAX = 17                         # hash size 8: user-tested 2026-11-22, above 17 unrelated images get grouped
 
 
@@ -101,6 +104,18 @@ class PixelScreen(QWidget):
         tl = QPoint((self.width() - img.width()) // 2, (self.height() - img.height()) // 2 + self._fly_offset())
         qp.drawImage(tl, img)
         self._draw_cursor(qp, tl.x(), tl.y() + img.height(), ts)
+        self._geo = (tl.x(), tl.y(), img.width(), 8 * ts)
+
+    def line_at(self, e) -> int:
+        """Index of the text line under the mouse, -1 outside."""
+        geo = getattr(self, "_geo", None)
+        if geo is None:
+            return -1
+        x0, y0, w, lh = geo
+        x, y = e.position().x(), e.position().y()
+        if not x0 <= x <= x0 + w or y < y0:
+            return -1
+        return int((y - y0) // lh)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -301,6 +316,7 @@ class SearchJob(QThread):
     done = Signal(list)
     failed = Signal(str)
     cancelled = Signal()
+    restored = Signal(object)                # saved session, still up to date: no scan needed
 
     def __init__(self, root: str, options: czkawka.Options, sigs: verify.SigCache):
         super().__init__()
@@ -308,13 +324,21 @@ class SearchJob(QThread):
         self.stop = threading.Event()
         self.go = threading.Event()
         self.confirm = True
+        self.paths: list[str] | None = None
+        self.saved: dict | None = None           # session.load() result to check against the folder
+        self.fp: dict | None = None
 
     def run(self):
         try:
             if self.confirm:
                 paths = czkawka.list_images(self.root, self.options.excluded, self.stop)
+                self.paths = paths
                 if self.stop.is_set():
                     raise czkawka.Cancelled()
+                self.fp = session.fingerprint(paths)
+                if self.saved is not None and self.saved.get("fingerprint") == self.fp:
+                    self.restored.emit(self.saved)           # same images as last time: groups as saved
+                    return
                 n = len(paths)
                 frac = czkawka.cached_fraction(paths, self.options)
                 eta = czkawka.estimate_seconds(n, frac)
@@ -358,9 +382,13 @@ def _dur(sec: float) -> str:
 
 
 class SearchScreen(PixelScreen):
+    chosen = Signal(object)          # big-folder warning: "go" | "other" | subfolder index | ("x", index)
+
     def __init__(self):
         super().__init__()
         self.root, self.n, self.eta, self.t0, self.msg = "", -1, 0.0, 0.0, ""
+        self.warn = None
+        self._first_sub = -1
 
     def start(self, root: str):
         self.root, self.n, self.eta, self.t0, self.msg = root, -1, 0.0, time.time(), ""
@@ -374,10 +402,13 @@ class SearchScreen(PixelScreen):
             if frac > 0.02:
                 out.append(f"({frac * 100:.0f} % ALREADY KNOWN)")
             out += ["", "ENTER: GO ON, SCAN WHOLE FOLDER"]
+            self._first_sub = -1
             if subs:
-                out += ["", "OR A SUBFOLDER (KEY 1-9):"]
-                w = min(22, max(len(s[0]) for s in subs))
-                out += [f"{i + 1} {nm[:w].ljust(w)} {k:6d}  {_dur(sec)}" for i, (nm, k, sec) in enumerate(subs)]
+                out += ["", "OR A SUBFOLDER (CLICK OR KEY 1-9),", "RIGHT CLICK / SHIFT+1-9: EXCLUDE IT", ""]
+                w = min(22, max(len(pixelfont.plain(s[0])) for s in subs))
+                self._first_sub = len(out)
+                out += [f"{i + 1} {pixelfont.plain(nm)[:w].ljust(w)} {k:6d}  {_dur(sec)}"
+                        for i, (nm, k, sec) in enumerate(subs)]
             out += ["", "ESC: CHOOSE ANOTHER FOLDER"]
             return out
         el = time.time() - self.t0
@@ -393,12 +424,49 @@ class SearchScreen(PixelScreen):
             out += ["", self.msg[:40]]
         return out
 
+    def mousePressEvent(self, e):
+        if self.warn is None or self._first_sub < 0:
+            return
+        k = self.line_at(e) - self._first_sub
+        if 0 <= k < len(self.warn[3]):
+            self.chosen.emit(("x", k) if e.button() == Qt.RightButton else k)
+
+
+class BestOfScreen(PixelScreen):
+    """After a scan: 'this folder holds mostly copies of other folders - a best-of? exclude it?'"""
+    answered = Signal(str)            # "exclude" | "keep" | "later"
+
+    def __init__(self):
+        super().__init__()
+        self.item, self.pos, self.total = ("", 0, 0), 0, 0
+
+    def ask(self, item: tuple[str, int, int], pos: int, total: int):
+        self.item, self.pos, self.total = item, pos, total
+        self.update()
+
+    def lines(self):
+        folder, c, n = self.item
+        name = pixelfont.plain(os.path.basename(folder.rstrip("\\/")) or folder).upper()[:36]
+        out = ["BEST-OF FOLDER?", "", name, "", f"{c} OF {n} IMAGES ARE ALSO", "IN OTHER FOLDERS.", "",
+               "X: EXCLUDE IT, DUPLICATES THERE ARE FINE", "ENTER: KEEP SCANNING IT",
+               "ESC: DECIDE LATER"]
+        if self.total > 1:
+            out += ["", f"({self.pos + 1} OF {self.total})"]
+        return out
+
+    def mousePressEvent(self, e):
+        line = self.line_at(e)
+        answer = {7: "exclude", 8: "keep", 9: "later"}.get(line)
+        if answer and e.button() == Qt.LeftButton:
+            self.answered.emit(answer)
+
 
 class SettingsScreen(PixelScreen):
     """Fixed-grid pixel settings screen with grey help lines; never shifts or rescales when cycling."""
     changed = Signal(str)                  # the key that changed
     COLS = 48
-    N_LINES = 18
+    N_LINES = 28
+    MAX_EX = 4                             # excluded folders listed (the rest as "+ N MORE")
 
     CHOICES = {
         "window": [("fullscreen", "FULLSCREEN"), ("window", "WINDOW")],
@@ -439,9 +507,17 @@ class SettingsScreen(PixelScreen):
         self.settings = settings
         self._geo = None
         self._stats_cache: tuple[int, int] | None = None
+        self._ex_line = -99
+        self._bin = (0, 0)
+
+    def refresh_bin(self):
+        items = Mover().bin_items()
+        self._bin = (len(items), sum(i["size"] for i in items))
+        self.update()
 
     def showEvent(self, e):
         self._stats_cache = Mover().stats()
+        self.refresh_bin()
         super().showEvent(e)
 
     def _value(self, key: str) -> str:
@@ -452,9 +528,9 @@ class SettingsScreen(PixelScreen):
             return "(ONLY USED WHEN REMOVE BY = MOVE)"
         m = self.settings.get("target_mode", "central")
         if m == "central":
-            return "<DRIVE>:\\DUPLIKILL\\<ORIGINAL PATH>"
+            return "<DRIVE>:\\DUPLIKILL-BIN\\<ORIGINAL PATH>"
         if m == "folder":
-            return "<SCANNED FOLDER>\\DUPLIKILL\\<PATH>"
+            return "<SCANNED FOLDER>\\DUPLIKILL-BIN\\<PATH>"
         return ("FOLDER: " + (self.settings.get("target") or "(NONE)").upper())[:44]
 
     def _help(self, key: str) -> str:
@@ -467,17 +543,31 @@ class SettingsScreen(PixelScreen):
         if self._stats_cache is None:
             self._stats_cache = Mover().stats()
         n_moved, b_moved = self._stats_cache
+        st = report.load_stats()
         out: list[tuple[str, QColor]] = [("SETTINGS", WHITE), ("", WHITE)]
         for n, (key, label) in enumerate(self.ROWS, 1):
             out.append((f"{n} {label.ljust(11)} {self._value(key)}"[:self.COLS].ljust(self.COLS), WHITE))
             out.append((f"  {self._help(key)}"[:self.COLS].ljust(self.COLS), GREY))
+        ex = self.settings.get("excluded", [])
+        self._ex_line = len(out)
+        out.append((f"{len(self.ROWS) + 1} {'EXCLUDED'.ljust(11)} {len(ex)} FOLDER(S)".ljust(self.COLS), WHITE))
+        out.append((("  CLICK: ADD A FOLDER" + ("   CLICK ONE BELOW: REMOVE" if ex else "")).ljust(self.COLS), GREY))
+        for d in ex[:self.MAX_EX]:
+            t = pixelfont.plain(d).upper()
+            t = t if len(t) <= self.COLS - 6 else "..." + t[-(self.COLS - 9):]
+            out.append((f"  [X] {t}".ljust(self.COLS), GREY))
+        if len(ex) > self.MAX_EX:
+            out.append((f"  + {len(ex) - self.MAX_EX} MORE (SETTINGS.JSON)".ljust(self.COLS), GREY))
         out += [
             ("", WHITE),
-            ("CONTROLS: CLICK=CROSS  SKULL=KILL ONE  0=FIT".ljust(self.COLS), GREY),
-            ("WHEEL=ZOOM  SPACE/ARROWS=GROUP  TAB=SOLO".ljust(self.COLS), GREY),
-            (f"JOURNAL: {n_moved} MOVED ({human(b_moved)})  CFG: SETTINGS.JSON"[:self.COLS].ljust(self.COLS), GREY),
+            ("CLICK=CROSS  DEL/BACKSPACE=DELETE CROSSED".ljust(self.COLS), GREY),
+            ("SPACE/DOWN=NEXT GROUP  UP=PREVIOUS  WHEEL=ZOOM".ljust(self.COLS), GREY),
+            (f"FREED SO FAR: {st['images']} IMAGES, {human(max(0, st['bytes']))}"[:self.COLS].ljust(self.COLS), WHITE),
+            ("  CLICK: SHARE THESE NUMBERS (GITHUB)   F8: BUG".ljust(self.COLS), GREY),
+            (f"BIN: {self._bin[0]} IMAGES, {human(self._bin[1])}"[:self.COLS].ljust(self.COLS), WHITE),
+            ("  CLICK OR B: LOOK AT THEM, RESTORE SINGLE ONES".ljust(self.COLS), GREY),
             ("", WHITE),
-            ("KEY 1-5 OR CLICK ROW: CHANGE    F1: HELP   ESC: BACK"[:self.COLS].ljust(self.COLS), WHITE),
+            (f"KEY 1-{len(self.ROWS) + 1} / CLICK: CHANGE   F1: HELP   ESC: BACK"[:self.COLS].ljust(self.COLS), WHITE),
         ]
         return out
 
@@ -503,6 +593,9 @@ class SettingsScreen(PixelScreen):
 
     def cycle(self, n: int):
         """Next choice of row n (1-based)."""
+        if n == len(self.ROWS) + 1:
+            self.changed.emit("excluded_add")
+            return
         if not 1 <= n <= len(self.ROWS):
             return
         key = self.ROWS[n - 1][0]
@@ -521,38 +614,54 @@ class SettingsScreen(PixelScreen):
         line = int((e.position().y() - top) // lh)
         if 2 <= line < 2 + 2 * len(self.ROWS):
             self.cycle((line - 2) // 2 + 1)
+        elif line in (len(self._rows_with_color()) - 4, len(self._rows_with_color()) - 3):
+            self.changed.emit("open_bin")
+        elif line in (len(self._rows_with_color()) - 6, len(self._rows_with_color()) - 5):
+            self.changed.emit("share_stats")
+        elif line in (self._ex_line, self._ex_line + 1):
+            self.cycle(len(self.ROWS) + 1)
+        elif 0 <= line - self._ex_line - 2 < min(self.MAX_EX, len(self.settings.get("excluded", []))):
+            self.changed.emit(f"excluded_del:{line - self._ex_line - 2}")
 
 
 class HelpScreen(PixelScreen):
-    """Fixed-grid F1 help screen: full keyboard & mouse reference in white/grey pixel font."""
+    """F1 help: the core keys first in double size, then the full reference in white/grey."""
     COLS = 52
-    N_LINES = 21
+    N_LINES = 30                            # core lines count twice
 
+    CORE = [                                # max 26 characters: drawn at double size
+        "CLICK IMAGE: CROSS IT",
+        "DEL / BACKSPACE: DELETE",
+        "   ALL CROSSED, NEXT GROUP",
+        "SPACE / DOWN: NEXT GROUP",
+        "UP: PREVIOUS GROUP",
+    ]
     ITEMS = [
-        ("DUPLIKILL - HELP (F1)", WHITE),
         ("", WHITE),
         ("REVIEW (IMAGE COMPARE)", WHITE),
-        ("LEFT CLICK IMAGE     ", "TOGGLE DELETE CROSS (X)"),
-        ("SKULL (CENTER SEAM)  ", "REMOVE THIS ONE IMAGE AT ONCE"),
+        ("RIGHT / PAGE DOWN    ", "NEXT GROUP (LIKE SPACE)"),
+        ("LEFT / PAGE UP       ", "PREVIOUS GROUP (LIKE UP)"),
+        ("SKULL ON AN IMAGE    ", "REMOVE THIS ONE IMAGE AT ONCE"),
         ("ONLY / KEEP BEST     ", "CROSS OUT ALL OTHER IMAGES"),
-        ("DEL / N X DEL BUTTON ", "REMOVE CROSSED & NEXT GROUP"),
-        ("MOUSE WHEEL / 0      ", "SYNC ZOOM AT CURSOR / FIT"),
-        ("MIDDLE / RIGHT MOUSE ", "DRAG = SYNC PAN, HOLD = BLINK"),
-        ("TAB / SIDE BUTTONS   ", "SOLO ONE IMAGE / FLIP NEXT"),
-        ("< > / SPACE / ARROWS ", "NEXT / PREVIOUS GROUP"),
-        ("CTRL+Z               ", "UNDO LAST MOVE (RESTORES)"),
+        ("MOUSE WHEEL / 0      ", "ZOOM ALL AT CURSOR / FIT"),
+        ("MIDDLE / RIGHT MOUSE ", "DRAG = PAN, HOLD = BLINK"),
+        ("TAB / SIDE BUTTONS   ", "ONE IMAGE ALONE / NEXT ONE"),
+        ("CTRL+Z               ", "UNDO LAST DELETE"),
+        ("ESC                  ", "BACK TO THE OVERVIEW"),
         ("", WHITE),
         ("OVERVIEW & GENERAL", WHITE),
-        ("CLICK GROUP / WHEEL  ", "OPEN GROUP / ZOOM NET"),
-        ("STRICT <###..> LOOSE ", "LIVE SIMILARITY THRESHOLD"),
+        ("CLICK GROUP / ENTER  ", "OPEN GROUP"),
+        ("STRICT <###..> LOOSE ", "SIMILARITY, SEARCHES AT ONCE"),
         ("S / F11 / F1         ", "SETTINGS / FULLSCREEN / HELP"),
+        ("B                    ", "BIN: SEE + RESTORE REMOVED ONES"),
+        ("U / F8               ", "INSTALL UPDATE / REPORT A BUG"),
         ("ESC (2X ON START)    ", "ONE STEP BACK (QUIT ON START)"),
         ("", WHITE),
         ("F1 / ESC / CLICK: BACK", WHITE),
     ]
 
     def lines(self) -> list[str]:
-        out = []
+        out = [l.ljust(self.COLS) for l in self.CORE]
         for item in self.ITEMS:
             if isinstance(item[1], QColor):
                 out.append(item[0].ljust(self.COLS))
@@ -563,14 +672,17 @@ class HelpScreen(PixelScreen):
     def paintEvent(self, e):
         qp = QPainter(self)
         self._paint_bg(qp)
-        ts = max(2, int(0.78 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
+        ts = max(1, int(0.85 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
         lh = 8 * ts
         w = self.COLS * lh
-        h = len(self.ITEMS) * lh
+        h = (2 * len(self.CORE) + len(self.ITEMS)) * lh
         x0 = (self.width() - w) // 2
         y0 = (self.height() - h) // 2 + self._fly_offset()
+        for idx, text in enumerate(self.CORE):              # the core: double size, white
+            qp.drawImage(QPoint(x0, y0 + idx * 2 * lh), pixelfont.render([text], 2 * ts, WHITE))
+        y1 = y0 + 2 * len(self.CORE) * lh
         for idx, item in enumerate(self.ITEMS):
-            y = y0 + idx * lh
+            y = y1 + idx * lh
             if isinstance(item[1], QColor):
                 text, col = item
                 if text.strip():
@@ -584,6 +696,8 @@ class HelpScreen(PixelScreen):
 
 
 class Main(QMainWindow):
+    update_found = Signal(object)          # updater.check() result, from a background thread
+    update_progress = Signal(int, int, str)  # bytes done, total, installer path when finished ("" before)
     def __init__(self, dry_run: bool = False):
         super().__init__()
         self.setWindowTitle("Duplikill")
@@ -604,17 +718,30 @@ class Main(QMainWindow):
         self.stack.currentChanged.connect(self._screen_changed)
         self.start = StartScreen()
         self.search = SearchScreen()
+        self.search.chosen.connect(self._answer)
         self.settings_screen = SettingsScreen(self.settings)
         self.settings_screen.changed.connect(self._setting_changed)
+        self.bestof_screen = BestOfScreen()
+        self.bestof_screen.answered.connect(self._bestof_answer)
+        self._bestof: list[tuple[str, int, int]] = []
+        self._bestof_excluded = False
         self.help_screen = HelpScreen()
         self.help_screen.clicked.connect(self.close_help)
         self.stack.addWidget(self.start)
         self.stack.addWidget(self.search)
         self.stack.addWidget(self.settings_screen)
         self.stack.addWidget(self.help_screen)
+        self.stack.addWidget(self.bestof_screen)
+        self.bin_view = BinView(self.thumbs, Mover())
+        self.bin_view.back.connect(self.close_bin)
+        self.bin_view.restored.connect(self._restored)
+        self.stack.addWidget(self.bin_view)
+        self._bin_from = None
+        self._bin_changed = False
         self._settings_from = None
         self._help_from = None
         self._delete_ok = False                  # 'delete forever' confirmed once per session
+        self._hint_done = False
         self.start.clicked.connect(self.pick)
         self.start.intro_done.connect(self.pick)
         self.nebula: Nebula | None = None
@@ -635,6 +762,17 @@ class Main(QMainWindow):
         self.fire_all_btn = PixelButton(self.stack, "")
         self.fire_all_btn.clicked.connect(self.fire_all)
         self.fire_all_btn.hide()
+        self.bug_btn = PixelButton(self.stack, "F8: REPORT BUG")   # after an error
+        self.bug_btn.clicked.connect(self.report_bug)
+        self.bug_btn.hide()
+        self.update_btn = PixelButton(self.stack, "")        # appears when GitHub has a newer release
+        self.update_btn.clicked.connect(self.start_update)
+        self.update_btn.hide()
+        self._update: dict | None = None
+        self.update_found.connect(self._update_found)
+        self.update_progress.connect(self._update_progress)
+        if self.settings.get("check_updates", True) and getattr(sys, "frozen", False):
+            threading.Thread(target=self._check_update, daemon=True).start()
         self.setFocusPolicy(Qt.StrongFocus)
         self._last_esc = 0.0
         QApplication.instance().installEventFilter(self)
@@ -693,11 +831,22 @@ class Main(QMainWindow):
             self.search.start(root)
             self.stack.setCurrentWidget(self.search)
         from .actions import auto_root
-        never = [auto_root(root), os.path.join(root, "Duplikill")] + \
-            ([self.settings["target"]] if self.settings.get("target") else [])
+        drive = os.path.splitdrive(os.path.abspath(root))[0] + os.sep
+        never = [auto_root(root), os.path.join(root, "Duplikill-Bin"), os.path.join(root, "Duplikill"),
+                 os.path.join(drive, "Duplikill")] + \
+            ([self.settings["target"]] if self.settings.get("target") else []) + list(self.settings.get("excluded", []))
         self.job = SearchJob(root, czkawka.Options(max_diff=int(self.settings["max_diff"]),
                                                    hash_size=int(self.settings["hash_size"]),
                                                    excluded=[d for d in never if os.path.isdir(d)]), self.sigs)
+        if quiet:
+            saved = session.load(root, int(self.settings["max_diff"]), int(self.settings["hash_size"]))
+            if saved is not None and saved.get("fingerprint") == getattr(self, "_fp", None):
+                self.slider.busy = False
+                self._found(saved["groups"], saved)              # this strictness was saved: no scan
+                return
+        else:
+            self.job.saved = session.load(root, int(self.settings["max_diff"]), int(self.settings["hash_size"]))
+        self.job.restored.connect(lambda saved: self._found(saved["groups"], saved))
         self.job.counted.connect(self._counted)
         self.job.confirm = not quiet
         self.job.ask.connect(self._ask)
@@ -711,7 +860,102 @@ class Main(QMainWindow):
             self.job.stop.set()
             self.job.go.set()
 
+    # ------------------------------------------------------------ update
+    def _check_update(self):
+        from . import __version__, updater
+        info = updater.check(__version__)
+        if info:
+            self.update_found.emit(info)
+
+    def _update_found(self, info: dict):
+        self._update = info
+        self.update_btn.text = f"U: UPDATE TO V{info['version']}"
+        self._screen_changed(0)
+
+    def start_update(self):
+        """Download Duplikill-Setup.exe in the background, then run it and quit (it starts Duplikill again)."""
+        if not self._update or getattr(self, "_updating", False):
+            return
+        self._updating = True
+        info = self._update
+
+        def work():
+            from . import updater
+            try:
+                path = updater.download(info["url"], updater.update_dir(),
+                                        lambda d, t: self.update_progress.emit(d, t, ""))
+                self.update_progress.emit(1, 1, path)
+            except Exception as ex:                      # shown on the button, the app keeps running
+                self.update_progress.emit(-1, 0, str(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_progress(self, done: int, total: int, path: str):
+        if done < 0:
+            self._updating = False
+            self.update_btn.text = "UPDATE FAILED - U: TRY AGAIN"
+        elif path:
+            from . import updater
+            self.save_session()
+            updater.run_installer(path)
+            self.close()
+            return
+        else:
+            pct = int(100 * done / total) if total else 0
+            self.update_btn.text = f"DOWNLOADING UPDATE {pct:3d} %"
+        self._screen_changed(0)
+        self.update_btn.update()
+
+    # ------------------------------------------------------------ bug report & statistics
+    def open_url(self, url: str):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl(url))
+
+    def report_bug(self):
+        """F8: prefilled GitHub issue in the browser; the user reads it and decides whether to submit."""
+        self.open_url(report.bug_url(__version__, report.last_crash()))
+        report.clear_crash()
+        self.bug_btn.hide()
+
+    def crashed(self):
+        self.bug_btn.setVisible(True)
+        ts = self.bug_btn.ts()
+        w = len(self.bug_btn.text) * 8 * ts
+        self.bug_btn.setGeometry(self.stack.width() - w - 3 * ts, 3 * ts, w, 8 * ts)
+        self.bug_btn.raise_()
+
+    def _count(self, photos, action: str, group_done: bool, sign: int = 1):
+        st = report.load_stats()
+        n, b = len(photos), sum(p.size for p in photos)
+        (report.count_removed if sign > 0 else report.count_undo)(st, n, b, action, group_done)
+        try:
+            report.save_stats(st)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------ saved results
+    def save_session(self):
+        """Open groups, crosses and position, so reopening the folder needs no scan (if nothing changed)."""
+        if self.dry_run or self.review is None or not getattr(self, "root", None) or getattr(self, "_fp", None) is None:
+            return
+        rv = self.review
+        keep = [g for g in self.groups if g.key not in rv.done]
+        pos = sum(1 for g in self.groups[:max(0, rv.i)] if g.key not in rv.done)
+        marks = {g.key: [g.photos[j].path for j in sorted(rv.marks.get(g.key, ())) if j < len(g.photos)] for g in keep}
+        try:
+            session.save(self.root, int(self.settings["max_diff"]), int(self.settings["hash_size"]), self._fp,
+                         keep, {k: v for k, v in marks.items() if v}, [], min(pos, max(0, len(keep) - 1)))
+        except OSError as ex:
+            print("session not saved:", ex, file=sys.stderr)
+
+    def _fp_change(self, photos, sign: int):
+        """Removed (-1) or restored (+1) files change the folder; keep the saved fingerprint in step."""
+        fp = getattr(self, "_fp", None)
+        if fp is not None:
+            self._fp = session.adjust(fp, photos, sign)
+
     def closeEvent(self, e):
+        self.save_session()
         if self.job is not None and self.job.isRunning():
             self.job.stop.set()
             self.job.go.set()
@@ -739,8 +983,28 @@ class Main(QMainWindow):
         job.wait()
         if choice == "other":
             self.pick()
+        elif isinstance(choice, tuple):                       # ("x", i): exclude that subfolder, count again
+            self.exclude(os.path.join(self.root, subs[choice[1]][0]))
+            self.run_search(self.root)
         else:
             self.run_search(os.path.join(self.root, subs[choice][0]))
+
+    @staticmethod
+    def _digit(e) -> int:
+        """0-8 for the keys 1-9 (also with Shift, which turns them into !"... on a German keyboard), else -1."""
+        code = e.nativeVirtualKey()
+        if 0x31 <= code <= 0x39:
+            return code - 0x31
+        if Qt.Key_1 <= e.key() <= Qt.Key_9:
+            return e.key() - Qt.Key_1
+        return -1
+
+    def exclude(self, folder: str):
+        ex = self.settings.setdefault("excluded", [])
+        folder = os.path.normpath(folder)
+        if all(os.path.normcase(folder) != os.path.normcase(x) for x in ex):
+            ex.append(folder)
+        save_settings(self.settings)
 
     def _failed(self, msg):
         print(msg, file=sys.stderr)
@@ -756,6 +1020,7 @@ class Main(QMainWindow):
             self._close_now()
 
     def _close_now(self):
+        self.save_session()
         if self.job is not None and self.job.isRunning():
             self.job.stop.set()
             self.job.go.set()
@@ -781,6 +1046,9 @@ class Main(QMainWindow):
     def eventFilter(self, obj, e):
         """F1 opens/closes help anywhere; Esc steps back screen by screen (double Esc on start quits)."""
         if e.type() == QEvent.KeyPress and not e.isAutoRepeat():
+            if e.key() == Qt.Key_F8:
+                self.report_bug()
+                return True
             if e.key() == Qt.Key_F1:
                 if self.stack.currentWidget() is self.help_screen:
                     self.close_help()
@@ -822,8 +1090,17 @@ class Main(QMainWindow):
                 self._answer("go")
             elif k == Qt.Key_Escape:
                 self._answer("other")
-            elif Qt.Key_1 <= k <= Qt.Key_9 and k - Qt.Key_1 < len(subs):
-                self._answer(k - Qt.Key_1)
+            else:
+                n = self._digit(e)
+                if 0 <= n < len(subs):
+                    self._answer(("x", n) if e.modifiers() & Qt.ShiftModifier else n)
+        elif cur is self.bestof_screen:
+            if k == Qt.Key_X:
+                self._bestof_answer("exclude")
+            elif k in (Qt.Key_Return, Qt.Key_Enter):
+                self._bestof_answer("keep")
+            elif k == Qt.Key_Escape:
+                self._bestof_answer("later")
         elif cur is self.help_screen:
             if k in (Qt.Key_Escape, Qt.Key_F1, Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
                 self.close_help()
@@ -832,12 +1109,20 @@ class Main(QMainWindow):
                 self.close_settings()
             elif Qt.Key_1 <= k <= Qt.Key_9:
                 self.settings_screen.cycle(k - Qt.Key_0)
+        elif k == Qt.Key_U and cur in (self.start, self.nebula) and self._update:
+            self.start_update()
+        elif cur is self.bin_view:
+            self.bin_view.keyPressEvent(e)
+        elif k == Qt.Key_B and cur in (self.start, self.nebula, self.settings_screen):
+            self.open_bin()
         elif k == Qt.Key_S and cur in (self.start, self.nebula):
             self.open_settings()
         elif k in (Qt.Key_Delete, Qt.Key_Backspace) and cur is self.nebula:
             self.fire_all()
         elif k in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter) and cur is self.nebula and self.nebula is not None:
-            idx = next((i for i, a in enumerate(self.nebula.alive) if a), -1)
+            cur_i = self.review.i if self.review is not None else -1
+            alive = self.nebula.alive
+            idx = cur_i if 0 <= cur_i < len(alive) and alive[cur_i] else next((i for i, a in enumerate(alive) if a), -1)
             if idx >= 0:
                 self.open_group(idx)
         elif cur is self.review and self.review is not None:
@@ -869,6 +1154,11 @@ class Main(QMainWindow):
                 b.raise_()
         cur = self.stack.currentWidget()
         show_corner = cur in (self.start, neb) and cur is not None
+        self.update_btn.setVisible(show_corner and self._update is not None)
+        if self.update_btn.isVisible():
+            ts = self.update_btn.ts()
+            self.update_btn.setGeometry(3 * ts, 3 * ts, len(self.update_btn.text) * 8 * ts, 8 * ts)
+            self.update_btn.raise_()
         self.settings_btn.setVisible(show_corner)
         self.help_btn.setVisible(show_corner)
         if show_corner:
@@ -902,7 +1192,40 @@ class Main(QMainWindow):
             back = self.start
         self.stack.setCurrentWidget(back)
 
+    def open_bin(self):
+        cur = self.stack.currentWidget()
+        if cur is not self.bin_view:
+            self._bin_from = cur
+            self.bin_view.reload()
+            self.stack.setCurrentWidget(self.bin_view)
+            self.bin_view.setFocus()
+
+    def close_bin(self):
+        back = self._bin_from if self._bin_from in (self.start, self.nebula, self.settings_screen) else self.start
+        self.stack.setCurrentWidget(back)
+        if back is self.settings_screen:
+            self.settings_screen.refresh_bin()
+        if self._bin_changed and getattr(self, "root", None) and self.nebula is not None:
+            self._bin_changed = False
+            self.run_search(self.root, quiet=True)      # restored images may form groups again
+
+    def _restored(self, paths: list[str]):
+        self._bin_changed = True
+        sizes = []
+        for p in paths:
+            try:
+                sizes.append(os.path.getsize(p))
+            except OSError:
+                pass
+        st = report.load_stats()
+        report.count_undo(st, len(sizes), sum(sizes), "move", False)
+        try:
+            report.save_stats(st)
+        except OSError:
+            pass
+
     def open_settings(self):
+        self._ex_before = list(self.settings.get("excluded", []))
         self._settings_from = self.stack.currentWidget()
         self.stack.setCurrentWidget(self.settings_screen)
 
@@ -911,9 +1234,33 @@ class Main(QMainWindow):
         if back not in (self.start, self.nebula) or back is None:
             back = self.start
         self.stack.setCurrentWidget(back)
+        changed = self.settings.get("excluded", []) != getattr(self, "_ex_before", None)
+        if back is self.nebula and getattr(self, "root", None) and changed:
+            self.run_search(self.root, quiet=True)       # exclusions changed: search again without them
 
     def _setting_changed(self, key: str):
         s = self.settings
+        if key == "excluded_add":
+            d = QFileDialog.getExistingDirectory(self, "Duplikill - exclude a folder from scanning",
+                                                 getattr(self, "root", None) or s.get("last_root") or "")
+            if d:
+                self.exclude(d)
+            self.settings_screen.update()
+            return
+        if key == "open_bin":
+            self.open_bin()
+            return
+        if key == "share_stats":
+            self.open_url(report.stats_url(__version__, report.load_stats()))
+            return
+        if key.startswith("excluded_del:"):
+            ex = s.get("excluded", [])
+            k = int(key.split(":")[1])
+            if 0 <= k < len(ex):
+                ex.pop(k)
+            save_settings(s)
+            self.settings_screen.update()
+            return
         if key == "target_mode" and s["target_mode"] == "custom":
             d = QFileDialog.getExistingDirectory(self, "Folder for removed images", s.get("target") or "")
             if d:
@@ -931,8 +1278,14 @@ class Main(QMainWindow):
         save_settings(s)
         self.settings_screen.update()
 
-    def _found(self, groups):
+    def _found(self, groups, saved: dict | None = None):
+        if saved is None and getattr(self, "groups", None) is not None and self.review is not None:
+            self.save_session()                         # slider: keep the old strictness's crosses
         self.slider.busy = False
+        if saved is not None:
+            self._fp = saved["fingerprint"]
+        elif self.job is not None and self.job.fp is not None:
+            self._fp = self.job.fp
         self.history.clear()
         for w in (self.nebula, self.review):
             if w is not None:
@@ -950,7 +1303,43 @@ class Main(QMainWindow):
         self.review.delete_requested.connect(self.remove)
         self.review.kill_requested.connect(self.kill_one)
         self.review.marks_changed.connect(self._update_fire_all)
+        if saved is not None:
+            self.review.marks = {k: set(v) for k, v in saved["marks"].items()}
+            self.review.i = saved["position"]
         self.overview()
+        paths = self.job.paths if self.job is not None and saved is None else None
+        if paths and not self.dry_run:
+            st = report.load_stats()
+            st["scans"] += 1
+            st["scanned_images"] += len(paths)
+            try:
+                report.save_stats(st)
+            except OSError:
+                pass
+        if paths:                                       # a full scan (not the slider): look for best-of folders
+            from . import bestof
+            s = self.settings
+            self._bestof = bestof.candidates(groups, paths, s.get("excluded", []) + s.get("bestof_kept", []))
+            self._bestof_n, self._bestof_excluded = len(self._bestof), False
+            if self._bestof:
+                self.bestof_screen.ask(self._bestof[0], 0, self._bestof_n)
+                self.stack.setCurrentWidget(self.bestof_screen)
+
+    def _bestof_answer(self, answer: str):
+        folder = self._bestof.pop(0)[0]
+        if answer == "exclude":
+            self.exclude(folder)
+            self._bestof_excluded = True
+        elif answer == "keep":
+            self.settings.setdefault("bestof_kept", []).append(folder)
+            save_settings(self.settings)
+        if answer != "later" and self._bestof:
+            self.bestof_screen.ask(self._bestof[0], self._bestof_n - len(self._bestof), self._bestof_n)
+            return
+        self._bestof = []
+        self.overview()
+        if self._bestof_excluded:                       # same folder again without them (cache: quick)
+            self.run_search(self.root, quiet=True)
 
     # ------------------------------------------------------------ review
     def overview(self):
@@ -1000,6 +1389,9 @@ class Main(QMainWindow):
         self.review.show_group(i)
         self.stack.setCurrentWidget(self.review)
         self.review.setFocus()
+        if not self._hint_done:                     # once per start: the core keys blink big
+            self._hint_done = True
+            self.review.show_hint()
 
     def _remove_group(self, i: int, paths: list[str]):
         g = self.groups[i]
@@ -1008,6 +1400,10 @@ class Main(QMainWindow):
             moved = [(p, "") for p in paths]
         else:
             moved = self._act(paths, g.key)
+        gone = {m[0] for m in moved}
+        self._fp_change([p for p in g.photos if p.path in gone], -1)
+        if not self.dry_run:
+            self._count([p for p in g.photos if p.path in gone], self.settings["action"], True)
         self.history.append((i, moved, None, self.settings["action"]))
         self.review.done.add(g.key)
         self.nebula.hide(i)
@@ -1034,6 +1430,9 @@ class Main(QMainWindow):
             moved = [(path, "")]
         else:
             moved = self._act([path], g.key)
+        self._fp_change([photo], -1)
+        if not self.dry_run:
+            self._count([photo], self.settings["action"], len(g.photos) <= 2)
         j = self.review.remove_photo(path)
         self.history.append((i, moved, (j, photo), self.settings["action"]))
         if len(g.photos) < 2:                       # nothing left to compare
@@ -1079,6 +1478,11 @@ class Main(QMainWindow):
         if not self.dry_run:
             self._mover().undo_last()
         g = self.groups[i]
+        back = {m[0] for m in moved}
+        restored = [single[1]] if single is not None else [p for p in g.photos if p.path in back]
+        self._fp_change(restored, +1)
+        if not self.dry_run:
+            self._count(restored, action, single is None or len(g.photos) < 2, -1)
         if single is not None:                      # skull: put the one picture back in its place
             self.review.restore_photo(i, *single)
         else:
@@ -1092,8 +1496,22 @@ class Main(QMainWindow):
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
     app = QApplication(argv)
+    win: list = []
+
+    def hook(et, ev, tb):                       # log anonymised, keep running, offer F8
+        sys.__excepthook__(et, ev, tb)
+        try:
+            report.write_crash(et, ev, tb)
+            if win:
+                win[0].crashed()
+        except Exception:
+            pass
+    sys.excepthook = hook
     dry = "--dry-run" in argv
     w = Main(dry_run=dry)
+    win.append(w)
+    if report.last_crash():                     # the last run ended with an error
+        QTimer.singleShot(500, w.crashed)
     w.resize(1600, 950)
     w.apply_window_mode()
     roots = [a for a in argv[1:] if not a.startswith("--")]

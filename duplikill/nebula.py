@@ -240,8 +240,7 @@ class Nebula(QWidget):
         return ["**** DUPLIKILL ****",
                 "",
                 *([self.root_name, ""] if self.root_name else []),
-                f"{self.n_live} GROUPS",
-                f"{self.total_imgs} IMAGES",
+                f"{self.total_imgs - self.n_live} DUPLICATES",          # one image per group stays
                 f"{self.folders} FOLDERS",
                 f"{human(self.saving)} TO FREE",
                 "",

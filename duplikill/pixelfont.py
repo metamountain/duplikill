@@ -45,8 +45,19 @@ def glyph(ch: str) -> np.ndarray:
     return a[np.ix_(ys, xs)] > 127
 
 
+_SPELL = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "AE", "Ö": "OE", "Ü": "UE", "ß": "ss", "ẞ": "SS"})
+
+
+def plain(text: str) -> str:
+    """The C64 font has no umlauts or accents: ä -> ae, é -> e, anything else unknown -> ?"""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", text.translate(_SPELL))
+    return "".join(c if c.isascii() else ("?" if not unicodedata.combining(c) else "") for c in t)
+
+
 def bitmap(lines: list[str]) -> np.ndarray:
     """bool array (rows*8, cols*8); lines left aligned."""
+    lines = [plain(l) for l in lines]
     cols = max((len(l) for l in lines), default=0)
     out = np.zeros((len(lines) * CELL, cols * CELL), bool)
     for r, line in enumerate(lines):

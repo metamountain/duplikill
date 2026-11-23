@@ -74,6 +74,19 @@ def test_move_and_undo(lib, tmp_path):
     assert m.undo_last() is None
 
 
+def test_bin_list_and_restore_one(lib, tmp_path):
+    m = actions.Mover(str(tmp_path / "out"))
+    a, b = str(lib / "a" / "x2.jpg"), [str(p) for p in (lib / "a").glob("*.jpg") if str(p) != str(lib / "a" / "x2.jpg")][0]
+    m.move([a, b], "g1")
+    items = m.bin_items()
+    assert sorted(i["src"] for i in items) == sorted([a, b])            # sidecars are not listed
+    os.remove(next(i["dst"] for i in items if i["src"] == b))         # deleted by hand in Explorer
+    assert [i["src"] for i in m.bin_items()] == [a]
+    assert m.restore([a]) == [a]
+    assert os.path.exists(a) and os.path.exists(str(lib / "a" / "x2.xmp"))   # sidecar came back too
+    assert m.bin_items() == []
+
+
 def test_done_groups_hidden(lib):
     cache = index.Cache()
     photos = index.scan([str(lib)], cache, index.CpuEngine(2), lambda *a: None)
@@ -99,13 +112,13 @@ def test_cuda_matches_cpu(lib):
 
 def test_auto_target_is_duplikill_folder_on_same_drive():
     from duplikill.actions import target_for
-    assert target_for(r"D:\Pictures\2019\a.jpg", "") == r"D:\Duplikill\Pictures\2019\a.jpg"
+    assert target_for(r"D:\Pictures\2019\a.jpg", "") == r"D:\Duplikill-Bin\Pictures\2019\a.jpg"
     assert target_for(r"D:\Pictures\2019\a.jpg", r"E:\out") == r"E:\out\D\Pictures\2019\a.jpg"
 
 
 def test_target_modes():
     from duplikill.actions import target_for
     p = r"D:\Pics\2019\Trip\a.jpg"
-    assert target_for(p, "", "central") == r"D:\Duplikill\Pics\2019\Trip\a.jpg"
-    assert target_for(p, "", "folder", r"D:\Pics\2019") == r"D:\Pics\2019\Duplikill\Trip\a.jpg"
+    assert target_for(p, "", "central") == r"D:\Duplikill-Bin\Pics\2019\Trip\a.jpg"
+    assert target_for(p, "", "folder", r"D:\Pics\2019") == r"D:\Pics\2019\Duplikill-Bin\Trip\a.jpg"
     assert target_for(p, r"E:\out", "custom") == r"E:\out\D\Pics\2019\Trip\a.jpg"
