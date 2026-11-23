@@ -32,7 +32,10 @@ class Group:
         self.photos.sort(key=lambda p: (p.taken if p.taken is not None else p.mtime, p.path))
         self.key = self.kind + ":" + hashlib.blake2b("\n".join(sorted(p.path for p in self.photos)).encode(),
                                                        digest_size=12).hexdigest()
-        self.best = pick_best(self)
+        b = pick_best(self)
+        if 0 < b < len(self.photos):
+            self.photos.insert(0, self.photos.pop(b))
+        self.best = 0
 
     @property
     def bytes(self) -> int:

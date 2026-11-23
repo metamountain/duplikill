@@ -132,6 +132,8 @@ class Review(QWidget):
         self.only_rects: dict[int, QRectF] = {}
         self.fire_rect = QRectF()
         self.keep_best_rect = QRectF()
+        self.lock_best_rect = QRectF()
+        self.best_locked = False
         self.prev_rect = QRectF()
         self.next_rect = QRectF()
         self.hub_rect = QRectF()
@@ -206,6 +208,12 @@ class Review(QWidget):
         self.full.clear()
         self.levels.clear()
         self.pix.clear()                    # only the current group's pixmaps stay in memory
+        if self.best_locked:
+            g = self.group
+            if g is not None and len(g.photos) >= 2 and not self.marks.get(g.key):
+                best = g.best if 0 <= g.best < len(g.photos) else 0
+                self.marks[g.key] = {k for k in range(len(g.photos)) if k != best}
+                self.marks_changed.emit()
         self.reset_view()
         for k in range(self.i, min(len(self.groups), self.i + 4)):     # preload ahead
             for p in self.groups[k].photos:
@@ -259,15 +267,36 @@ class Review(QWidget):
         self.update()
 
     def keep_best(self):
-        """Cross out all images except g.best."""
+        """Toggle crossing out all images except g.best (second click clears the crosses)."""
         g = self.group
         if g is None or len(g.photos) < 2:
             return
         best = g.best if 0 <= g.best < len(g.photos) else 0
+        others = {k for k in range(len(g.photos)) if k != best}
         m = self.marked()
-        m.clear()
-        m.update(k for k in range(len(g.photos)) if k != best)
+        if m == others:
+            m.clear()
+        else:
+            m.clear()
+            m.update(others)
         self.marks_changed.emit()
+        self.update()
+
+    def toggle_best_lock(self):
+        """Lock/unlock auto-keep-best: when locked, every group pre-crosses all non-best images."""
+        self.best_locked = not self.best_locked
+        g = self.group
+        if g is not None and len(g.photos) >= 2:
+            best = g.best if 0 <= g.best < len(g.photos) else 0
+            others = {k for k in range(len(g.photos)) if k != best}
+            m = self.marked()
+            if self.best_locked:
+                m.clear()
+                m.update(others)
+                self.marks_changed.emit()
+            elif m == others:
+                m.clear()
+                self.marks_changed.emit()
         self.update()
 
     def fire(self):
@@ -411,6 +440,7 @@ class Review(QWidget):
         self.only_rects.clear()
         self.fire_rect = QRectF()
         self.keep_best_rect = QRectF()
+        self.lock_best_rect = QRectF()
         self.prev_rect = QRectF()
         self.next_rect = QRectF()
         self.hub_rect = QRectF()
@@ -589,19 +619,21 @@ class Review(QWidget):
             p2.drawImage(QPoint(pad // 2, pad // 2), raw2)
             p2.end()
             action_kind = "next_end"
-        elif not m and len(g.photos) >= 3 and len(vis) >= 3:
-            raw2 = pixelfont.render([" KEEP BEST "], ts, WHITE, QColor(0, 0, 0, 220))
-            row2 = QImage(raw2.width() + pad, raw2.height() + pad, QImage.Format_RGBA8888)
-            row2.fill(QColor(0, 0, 0, 220))
-            p2 = QPainter(row2)
-            p2.drawImage(QPoint(pad // 2, pad // 2), raw2)
-            p2.end()
-            action_kind = "keep_best"
+
+        show_heart = len(g.photos) >= 2 and len(vis) >= 2
+        heart_icon = pixelfont.render_bits(pixelfont.icon("heart"), ts * 2,
+                                           QColor(0, 0, 0) if self.best_locked else WHITE, QColor(0, 0, 0, 0))
+        hw, hh = heart_icon.width() + 2 * pad, heart_icon.height() + 2 * pad
+        lock_name = "lock" if self.best_locked else "unlock"
+        lock_icon = pixelfont.render_bits(pixelfont.icon(lock_name), ts,
+                                          QColor(0, 0, 0) if self.best_locked else WHITE, QColor(0, 0, 0, 0))
+        lw, lh = lock_icon.width() + pad, lock_icon.height() + pad
 
         w2 = row2.width() if row2 is not None else 0
         h2 = row2.height() if row2 is not None else 0
-        hub_w = max(w1, w2)
-        hub_h = h1 + (GAP + h2 if h2 else 0)
+        h_heart = (GAP + hh) if show_heart else 0
+        hub_w = max(w1, w2, hw + GAP + lw if show_heart else 0)
+        hub_h = h1 + (GAP + h2 if h2 else 0) + h_heart
         if hub_cy < 0:
             hub_x = (W - hub_w) / 2
             hub_y = pad
@@ -618,17 +650,36 @@ class Review(QWidget):
         self.prev_rect = QRectF(r1_x, r1_y, char_w * 3, h1)
         self.next_rect = QRectF(r1_x + w1 - char_w * 3, r1_y, char_w * 3, h1)
 
+        cur_y = int(hub_y + h1)
         if row2 is not None:
             r2_x = int(hub_x + (hub_w - w2) / 2)
-            r2_y = int(hub_y + h1 + GAP)
+            r2_y = cur_y + GAP
             qp.drawImage(QPoint(r2_x, r2_y), row2)
             r2_rect = QRectF(r2_x, r2_y, w2, h2)
             if action_kind == "fire":
                 self.fire_rect = r2_rect
-            elif action_kind == "keep_best":
-                self.keep_best_rect = r2_rect
             elif action_kind == "next_end":
                 self.next_rect = r2_rect
+            cur_y = r2_y + h2
+
+        if show_heart:
+            best = g.best if 0 <= g.best < len(g.photos) else 0
+            best_active = bool(m) and m == {k for k in range(len(g.photos)) if k != best}
+            h_inv = self.best_locked or best_active
+            h_icon = pixelfont.render_bits(pixelfont.icon("heart"), ts * 2,
+                                           QColor(0, 0, 0) if h_inv else WHITE, QColor(0, 0, 0, 0))
+            hx = int(hub_x + (hub_w - hw) / 2)
+            hy = cur_y + GAP
+            h_rect = QRectF(hx, hy, hw, hh)
+            qp.fillRect(h_rect, WHITE if h_inv else QColor(0, 0, 0, 215))
+            qp.drawImage(QPoint(hx + pad, hy + pad), h_icon)
+            self.keep_best_rect = h_rect
+            lx = hx + hw + GAP
+            ly = hy + hh - lh
+            l_rect = QRectF(lx, ly, lw, lh)
+            qp.fillRect(l_rect, WHITE if self.best_locked else QColor(0, 0, 0, 215))
+            qp.drawImage(QPoint(lx + pad // 2, ly + pad // 2), lock_icon)
+            self.lock_best_rect = l_rect
 
     # ------------------------------------------------------------ input
     def _hit(self, pt: QPointF) -> int:
@@ -699,6 +750,8 @@ class Review(QWidget):
                 self.keep_only(oj)
             elif not self.fire_rect.isNull() and self.fire_rect.contains(pt):
                 self.fire()
+            elif not self.lock_best_rect.isNull() and self.lock_best_rect.contains(pt):
+                self.toggle_best_lock()
             elif not self.keep_best_rect.isNull() and self.keep_best_rect.contains(pt):
                 self.keep_best()
             elif not self.prev_rect.isNull() and self.prev_rect.contains(pt):

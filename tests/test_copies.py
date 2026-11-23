@@ -1,5 +1,7 @@
 import os
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -90,3 +92,56 @@ def test_merge_and_undo_in_one_step(archive, tmp_path):
             assert open(p, "rb").read() == data
     assert (root / "img0.jpg.xmp").exists() and not (album / "img0.jpg.xmp").exists()
     assert [e["src"] for e in mover.bin_items()] == [str(root / "other3.jpg")]      # older step untouched
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_same_folder_copies_and_merge(tmp_path, monkeypatch, qapp):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
+    copies._cache.clear()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    rng = np.random.default_rng(2)
+    for i in range(6):
+        base = str(folder / f"img{i}.jpg")
+        copy = str(folder / f"img{i} (1).jpg")
+        if i < 3:
+            Image.fromarray(rng.integers(0, 255, (40, 60, 3), dtype=np.uint8)).save(copy, quality=90)
+            with_xmp(copy, base)                # 3 pairs: XMP on the original, plain copy
+        else:
+            Image.fromarray(rng.integers(0, 255, (40, 60, 3), dtype=np.uint8)).save(base, quality=90)
+            with_xmp(base, copy)                # 3 pairs: XMP + sidecar on the copy
+            (folder / f"img{i} (1).jpg.xmp").write_text("sidecar")
+    paths = [str(p) for p in folder.rglob("*.jpg")]
+    groups = [Group("similar", [photo(str(folder / f"img{i}.jpg")), photo(str(folder / f"img{i} (1).jpg"))])
+              for i in range(6)]
+    [m] = copies.find(groups, paths)
+    assert m.same_folder is True
+    assert (m.count, m.swaps) == (6, 3)
+    from duplikill.app import MergeScreen
+    screen = MergeScreen()
+    screen.ask(m, 0, 1)
+    assert any("EXACT COPIES IN ONE FOLDER:" in line for line in screen.lines())
+    before = {p: open(p, "rb").read() for p in paths}
+    sidecars = {str(folder / f"img{i} (1).jpg.xmp"): "sidecar" for i in range(3, 6)}
+    mover = actions.Mover(str(tmp_path / "bin"))
+    remove, renames = m.plan()
+    mover.merge(remove, renames, "merge:same")
+    assert sorted(os.path.basename(p) for p in folder.iterdir() if p.suffix == ".jpg") == \
+           [f"img{i}.jpg" for i in range(6)]
+    for i in range(3):
+        assert open(folder / f"img{i}.jpg", "rb").read() == before[str(folder / f"img{i}.jpg")]   # tagged original kept
+    for i in range(3, 6):
+        assert open(folder / f"img{i}.jpg", "rb").read() == before[str(folder / f"img{i} (1).jpg")]   # tagged copy renamed
+        assert (folder / f"img{i}.jpg.xmp").read_text() == "sidecar"
+    assert len(mover.bin_items()) == 6
+    mover.undo_last("merge:same")
+    for p, data in before.items():
+        assert open(p, "rb").read() == data
+    for p, text in sidecars.items():
+        assert open(p).read() == text
+    assert len(mover.bin_items()) == 0

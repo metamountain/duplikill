@@ -1,17 +1,20 @@
-"""Exact copies across two folders, and merging them in one step.
+"""Exact copies, and merging them in one step: across two folders, or several copies inside one folder.
 
 "Exact" = the same picture data, whatever the metadata says: for a JPEG the bytes from the first SOS marker
 to the end (the compressed image), so a copy that only lost or gained tags (XMP, IPTC) still counts.
 Other formats: the whole file.
 
-A folder pair is offered for a merge when it shares at least MIN_COPIES such copies. The kept folder is the
-one whose images are mostly copies (the sorted album, not the big dump it came from). Per copy the file with
-more metadata wins: if the copy that goes holds the tags, it takes the place of the untagged one instead.
+A folder pair is offered for a merge when it shares at least MIN_COPIES such copies; a folder that holds at
+least MIN_COPIES same-folder copies is offered too. The kept folder of a pair is the one whose images are
+mostly copies (the sorted album, not the big dump it came from). Per copy the file with more metadata wins:
+if the copy that goes holds the tags, it takes the place of the untagged one instead - in one folder the
+cleanest filename (no " (1)" / copy suffix) is the keeper, so the tags end up under the original name.
 """
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -93,6 +96,15 @@ def _key(folder: str) -> str:
     return os.path.normcase(os.path.normpath(folder))
 
 
+_COPY_SUFFIX = re.compile(r"(\s*\(\d+\)|[~_ -]+(?:kopie|copy)\b.*|\s+-\s+.*|~+\d+)$", re.I)
+
+
+def _name_rank(path: str) -> tuple:
+    """Lower rank = preferred keeper name: no copy suffix, then shorter name, then alphabetical."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return (bool(_COPY_SUFFIX.search(stem)), len(os.path.basename(path)), os.path.normcase(path))
+
+
 @dataclass
 class Merge:
     keep: str                     # folder that keeps the pictures
@@ -102,6 +114,10 @@ class Merge:
     # (file in keep, file in other, metadata score of each); more metadata in the other file -> it moves over
     pairs: list[tuple[str, str, int, int]] = field(default_factory=list)
     album: str = ""               # the folder made of copies (the suggested keeper; stays when flipped)
+
+    @property
+    def same_folder(self) -> bool:
+        return _key(self.keep) == _key(self.other)
 
     @property
     def count(self) -> int:
@@ -141,14 +157,14 @@ def find(groups, paths: list[str], skip: list[str] = (), stop: threading.Event |
         total[_key(_folder(p))] += 1
         names.setdefault(_key(_folder(p)), _folder(p))
     skip_k = {_key(s) for s in skip}
-    # only groups with pictures of equal size in different folders can hold copies
+    # only groups with pictures of equal size can hold copies (same folder or across folders)
     todo = []
     for g in groups:
         by_dim = defaultdict(list)
         for p in g.photos:
             by_dim[(p.width, p.height)].append(p)
         for ps in by_dim.values():
-            if len({_key(_folder(p.path)) for p in ps}) > 1:
+            if len(ps) > 1:
                 todo.append(ps)
     sets: list[list[tuple[str, int]]] = []
     for ps in todo:
@@ -162,6 +178,17 @@ def find(groups, paths: list[str], skip: list[str] = (), stop: threading.Event |
         sets += [s for s in by_hash.values() if len(s) > 1]
     pairs: dict[tuple[str, str], list[tuple[str, str, int, int]]] = defaultdict(list)
     for s in sets:
+        by_dir: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for path, meta in s:
+            by_dir[_key(_folder(path))].append((path, meta))
+        for fa, s_dir in by_dir.items():
+            if fa in skip_k or len(s_dir) < 2:
+                continue
+            # same folder: the cleanest filename is the keeper, every other copy pairs with it
+            k, mk = min(s_dir, key=lambda x: _name_rank(x[0]))
+            for o, mo in s_dir:
+                if o != k:
+                    pairs[(fa, fa)].append((k, o, mk, mo))
         for i, (a, ma) in enumerate(s):
             for b, mb in s[i + 1:]:
                 fa, fb = _key(_folder(a)), _key(_folder(b))
@@ -174,13 +201,17 @@ def find(groups, paths: list[str], skip: list[str] = (), stop: threading.Event |
     for (fa, fb), ps in pairs.items():
         if len(ps) < min_copies:
             continue
-        m = Merge(names.get(fa, _folder(ps[0][0])), names.get(fb, _folder(ps[0][1])),
-                  total.get(fa, 0), total.get(fb, 0), ps)
-        share_a = m.count / max(1, m.n_keep)
-        share_b = m.count / max(1, m.n_other)
-        if share_b > share_a or (share_b == share_a and fb.count(os.sep) > fa.count(os.sep)):
-            m = m.flipped()
-        m.album = m.keep
+        if fa == fb:
+            folder = names.get(fa, _folder(ps[0][0]))
+            m = Merge(folder, folder, total.get(fa, 0), total.get(fa, 0), ps, album=folder)
+        else:
+            m = Merge(names.get(fa, _folder(ps[0][0])), names.get(fb, _folder(ps[0][1])),
+                      total.get(fa, 0), total.get(fb, 0), ps)
+            share_a = m.count / max(1, m.n_keep)
+            share_b = m.count / max(1, m.n_other)
+            if share_b > share_a or (share_b == share_a and fb.count(os.sep) > fa.count(os.sep)):
+                m = m.flipped()
+            m.album = m.keep
         out.append(m)
     out.sort(key=lambda m: -m.count)
     return out

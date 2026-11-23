@@ -179,13 +179,33 @@ def test_central_switches_pair_and_six_grid_and_right_pan(app):
     r = Review([pair, six], FakeThumbs())
     r.resize(1600, 900)
 
-    # 1. 2-image pair: switches near center seam, 1-click smart swap
+    # 1. 2-image pair: best always on left (index 0), KEEP BEST heart button opposite skulls, 1-click smart swap
+    pair_rev = Group("similar", [mk("worse", 1000), mk("better", 2500)])
+    assert os.path.basename(pair_rev.photos[0].path) == "better.jpg" and pair_rev.best == 0
     r.show_group(0)
     r.grab()
     assert abs(r.hub_rect.center().x() - 800) < 5 and abs(r.hub_rect.center().y() - 450) < 5
+    assert not r.keep_best_rect.isNull()
     for j, kr in r.kill_rects.items():
         assert abs(kr.center().x() - 800) < 120   # right next to vertical center seam, not at (0,0)!
         assert not kr.contains(r.rects[j].center())
+        assert kr.center().y() < r.hub_rect.center().y() < r.keep_best_rect.center().y()
+    r.keep_best()
+    assert r.marked() == {1}                      # keeps best (index 0 on left), crosses index 1 on right
+    r.keep_best()
+    assert r.marked() == set()                    # second click on heart deactivates again!
+    r.keep_best()
+    assert r.marked() == {1}
+    assert not r.lock_best_rect.isNull()
+    r.toggle_best_lock()
+    assert r.best_locked is True and r.marked() == {1}
+    r.show_group(1)                               # next group auto-crosses non-best while locked!
+    assert r.marked() == {1, 2, 3, 4, 5}
+    r.toggle_best_lock()
+    assert r.best_locked is False and r.marked() == set()
+    r.show_group(0)
+    r.toggle(1)
+    assert r.marked() == set()
     r.toggle(0)
     assert r.marked() == {0}
     r.toggle(1)                                   # 2-image smart swap: switches directly to {1}

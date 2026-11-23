@@ -478,7 +478,8 @@ def _short(folder: str, w: int = 30) -> str:
 
 
 class MergeScreen(PixelScreen):
-    """After a scan: 'these two folders share N exact copies - merge them?' (one key instead of N groups)."""
+    """After a scan: 'these two folders share N exact copies - merge them?' or 'N copies in one folder'.
+    One key instead of N groups."""
     answered = Signal(str)            # "merge" | "flip" | "bestof" | "later"
 
     def __init__(self):
@@ -494,6 +495,18 @@ class MergeScreen(PixelScreen):
         m = self.m
         if m is None:
             return []
+        if m.same_folder:
+            k = _short(m.keep)
+            out = ["EXACT COPIES - MERGE?", "", f"{m.count} EXACT COPIES IN ONE FOLDER:", "",
+                   f"{k}  ({m.n_keep} IMAGES)", ""]
+            if m.swaps:
+                out += [f"{m.swaps} COPIES HAVE MORE TAGS:", "TAGS ARE KEPT UNDER THE ORIGINAL NAME.", ""]
+            first = len(out)
+            out += [f"ENTER: REMOVE {m.count} DUPLICATE COPIES",
+                    "       (KEEP TAGS & CLEAN FILENAMES)",
+                    "ESC: DECIDE LATER"]
+            self._keys = {first: "merge", first + 1: "merge", first + 2: "later"}
+            return out
         k, o = _short(m.keep), _short(m.other)
         w = max(len(k), len(o))
         out = ["EXACT COPIES - MERGE?", "", f"{m.count} PICTURES ARE IN BOTH FOLDERS:", "",
@@ -1408,7 +1421,7 @@ class Main(QMainWindow):
             s = self.settings
             self._merges = list(job.copies or [])
             self._merge_n, self._rescan_after = len(self._merges), False
-            in_merge = [f for m in self._merges for f in (m.keep, m.other)]   # asked about already
+            in_merge = [f for m in self._merges if not m.same_folder for f in (m.keep, m.other)]   # asked about already
             self._bestof = [b for b in bestof.candidates(groups, job.paths, s.get("excluded", []) +
                                                          s.get("bestof_kept", []) + in_merge)]
             self._bestof_n, self._bestof_excluded = len(self._bestof), False
@@ -1432,6 +1445,8 @@ class Main(QMainWindow):
 
     def _merge_answer(self, answer: str):
         if not self._merges:
+            return
+        if self._merges[0].same_folder and answer in ("flip", "bestof"):
             return
         if answer == "flip":
             self._merges[0] = self._merges[0].flipped()
