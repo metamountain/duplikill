@@ -27,6 +27,11 @@ REPULSION_EVERY = 3    # with many groups the pairwise forces are recomputed onl
 FPS = 60
 REVERB_HIST = 48
 REVERB_TAPS = ((0, 0.60), (11, 0.35), (23, 0.20), (35, 0.10))
+CALM_SHARE = 0.09     # calm zone around the mouse: sigma as share of the shorter window side ...
+CALM_MIN = 70.0       # ... but at least this many pixels
+CALM_EASE = 0.12      # per frame: how fast things settle / wake up again
+CALM_RING = 2.2       # gravity ring at this many sigmas from the mouse ...
+RING_GAIN = 0.6       # ... where motion is this much stronger than normal
 WHITE = QColor(255, 255, 255)
 _SHADES = [QColor(v, v, v) for v in range(140, 256)]
 _EDGE_PENS = []
@@ -95,6 +100,7 @@ class Nebula(QWidget):
         self._bg_pm: QPixmap | None = None
         self._tip_key = None
         self._tip_img: QImage | None = None
+        self._calm = np.ones(n, float)      # 0 = still (right at the mouse), 1 = free motion
         if self.abstract:
             self.clumps = Clumps(groups, self.group_folder, len(self.folder_names))
             self.clump_rects = []
@@ -108,6 +114,7 @@ class Nebula(QWidget):
             self._chot_idx = -1
             self._chot_val = 0.0
             self._chot_vel = 0.0
+            self._calm_cl = np.ones(nf, float)
         else:
             self._disp = np.zeros((n, 2), float)
             self._dvel = np.zeros((n, 2), float)
@@ -322,6 +329,22 @@ class Nebula(QWidget):
             self._vhist[self._mhead] = self._mvel
         self._mactive[self._mhead] = 1.0 if self._mouse_in else 0.0
 
+    def _update_calm(self, screen_pos: np.ndarray) -> np.ndarray:
+        """Calm zone around the mouse: whatever lies there stops swaying and dodging, so it is easy to hit.
+        Smoothed over a few frames so nothing jumps when the mouse arrives or leaves."""
+        if self._mouse_in and len(screen_pos):
+            sigma = max(CALM_MIN, min(self.width(), self.height()) * CALM_SHARE)
+            d2 = ((screen_pos - self._mouse_raw) ** 2).sum(1)
+            target = 1.0 - np.exp(-d2 / (2.0 * sigma * sigma))
+            ring = np.exp(-((np.sqrt(d2) - CALM_RING * sigma) ** 2) / (2.0 * (0.55 * sigma) ** 2))
+            target = target * (1.0 + RING_GAIN * ring)    # gravity ring: a livelier band around the still eye
+        else:
+            target = np.ones(len(screen_pos), float)
+        if len(self._calm) != len(target):
+            self._calm = target.copy()
+        self._calm += (target - self._calm) * CALM_EASE
+        return self._calm
+
     def _ensure_clump_layout(self):
         ls = max(1, self.text_scale // 3)
         size = (self.width(), self.height(), ls)
@@ -346,6 +369,15 @@ class Nebula(QWidget):
             self.clump_rects = []
             return
         self._record_mouse(world=False)
+        away = getattr(self, "_away", None) is not None
+        if away:
+            kg, kc = np.ones(n), np.ones(nf)
+        else:
+            kg = self._update_calm(cl.group_positions(u, np.zeros((nf, 2))) + 0.5 * u)
+            kc = np.ones(nf)
+            np.minimum.at(kc, cl.group_clump, kg)      # a folder near the mouse holds still as a whole
+            self._calm_cl += (kc - self._calm_cl) * CALM_EASE
+            kc = self._calm_cl
         amp_c = min(9.5, max(4.5, u * 1.15))
         ph = cl.clump_phase
         off_clump = np.stack([
@@ -370,6 +402,7 @@ class Nebula(QWidget):
                 d2 = (delta * delta).sum(1)
                 w = np.exp(-d2 * inv_2scl) * act
                 f_cl += (delta * 0.012 + mv * 0.14) * (w * gain)[:, None]
+            f_cl *= kc[:, None]
             self._cl_vel = self._cl_vel * 0.935 - self._cl_disp * 0.055 + np.tanh(f_cl / 2.2) * 2.2
             self._cl_disp = np.clip(self._cl_disp + self._cl_vel, -14.0, 14.0)
         else:
@@ -377,6 +410,8 @@ class Nebula(QWidget):
             off_clump = off_clump + d * (1.35 ** self._away - 1.0)
 
         off_clump = off_clump + self._cl_disp
+        if not away:
+            off_clump = off_clump * kc[:, None]
 
         # 2. Gentle internal breathing & radial ripple (bounded to <= 0.42*u so blocks never tear apart!)
         amp_r = min(1.8, max(0.7, u * 0.24))
@@ -384,8 +419,9 @@ class Nebula(QWidget):
         wave_r = np.sin(t * 1.30 - cl.radial * 0.38 + cl.clump_phase[cl.group_clump])
         wave_t = np.cos(t * 0.86 - cl.radial * 0.38 + cl.group_phase)
         off_inner = cl.radial_dir * (wave_r * amp_r)[:, None] + cl.radial_perp * (wave_t * amp_t)[:, None]
+        off_inner = off_inner * kg[:, None]
 
-        cur_pos = cl.group_positions(u, off_clump) + off_inner + self._c_disp + cl.block_cr * (0.5 * u)
+        cur_pos = cl.group_positions(u, off_clump) + off_inner + self._c_disp * kg[:, None] + cl.block_cr * (0.5 * u)
         f_in = np.zeros((n, 2), float)
         glow_in = np.zeros(n, float)
         if getattr(self, "_away", None) is None:
@@ -408,6 +444,7 @@ class Nebula(QWidget):
 
         if 0 <= self.hover < n and self.alive[self.hover]:
             f_in[self.hover] *= 0.25
+        f_in *= kg[:, None]
         max_inner = max(1.5, u * 0.42)
         self._c_vel = self._c_vel * 0.92 - self._c_disp * 0.075 + np.tanh(f_in / 0.8) * 0.8
         self._c_disp = np.clip(self._c_disp + self._c_vel, -max_inner, max_inner)
@@ -430,13 +467,15 @@ class Nebula(QWidget):
             self._chot_val = 0.0
             self._chot_vel = 0.0
 
-        self.clump_rects = cl.group_rects(u, off_clump, off_inner + self._c_disp)
+        self.clump_rects = cl.group_rects(u, off_clump, off_inner + self._c_disp * kg[:, None])
 
     def _reverb_step(self):
         n = len(self.groups)
         if n == 0:
             return
         self._record_mouse(world=True)
+        screen = np.array([self.offset.x(), self.offset.y()]) + self.pos * self.scale
+        k = self._update_calm(screen)
         cur_pos = self.pos + self._disp
         tap_i = np.clip((np.linalg.norm(self.pos, axis=1) / max(self.hole, 60.0) * 4.0 + self.phase / math.tau * 6.0).astype(int), 0, 12)
         sig = np.maximum(self.r * 2.4, 140.0 / max(self.scale, 0.2))
@@ -461,6 +500,7 @@ class Nebula(QWidget):
 
         if 0 <= self.hover < n and self.alive[self.hover]:
             f_in[self.hover] *= 0.20
+        f_in *= np.minimum(k, 1.0)[:, None]          # the still eye does not soak up pushes either
 
         f_coup = np.zeros((n, 2), float)
         th_coup = np.zeros(n, float)
@@ -587,7 +627,8 @@ class Nebula(QWidget):
             np.sin(t * 0.58 + ph) * 0.72 + np.sin(t * 1.19 + ph * 2.1) * 0.28,
             np.cos(t * 0.44 + ph * 1.7) * 0.72 + np.cos(t * 0.93 + ph * 0.8) * 0.28,
         ], 1) * amp[:, None]
-        return self.pos + sway + self._disp
+        k = self._calm if len(self._calm) == len(self.pos) else np.ones(len(self.pos))
+        return self.pos + (sway + self._disp) * k[:, None]
 
     def _draw_edges(self, qp: QPainter, c: np.ndarray):
         if not len(self.edges):
