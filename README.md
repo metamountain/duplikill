@@ -1,7 +1,7 @@
 # Duplikill
 
-Thin out a big photo archive fast. Duplikill finds duplicates and near-identical series, shows each group
-on one screen, you cross out what should go, and move on to the next group.
+Thin out a big photo archive fast: exact copies go in one keypress per folder, similar shots are compared side
+by side, you cross out, and you move on.
 
 **[⬇ Duplikill-Setup.exe](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Setup.exe)** (installer) ·
 **[⬇ Portable ZIP](https://github.com/metamountain/duplikill/releases/latest/download/Duplikill-Portable-win64.zip)** ·
@@ -9,86 +9,69 @@ Windows 10/11, 64-bit, no Python needed.
 
 ![Overview](assets/overview.svg)
 
-## Fast scan
+> **Real archive, one year:** 4,702 photos. Rescan: **0.3 s**. Found **297 exact copies** spread over 2 album
+> folders: **1.8 s**. Cleaned up with **2 keypresses**, tags kept, undo with one `Ctrl+Z`.
 
-- **Stage 1: [Czkawka](https://github.com/qarmin/czkawka)** by Rafał Mikrut ([@qarmin](https://github.com/qarmin)), the Rust
-  engine behind Krokiet. It hashes about 80 new photos per second (4,108 photos from 2011: 53 s). Images it has
-  already seen come from its cache: the same folder again takes about 4 s. The cache is shared with an installed
-  Krokiet.
-- **Stage 2: verification.** Fast hashes sometimes put unrelated images together, or split one long series. Duplikill
-  checks every pair for structure, colour and capture date. A group is kept only if every image matches every other
-  one (no A→B→C chains), and series split by stage 1 are joined again. 400 groups / 2,400 photos: 0.14 s.
-- **Results are saved.** Reopen a folder and the groups, your crosses and your position are back at once. Duplikill
-  only rescans if images were added, changed or removed in the meantime.
-- **Big folders:** scans longer than about 90 s are announced first. You can pick a subfolder (click or 1–9), or exclude
-  one (right click / Shift+1–9).
-- **Similarity slider** (`STRICT … LOOSE`) in the overview: changing it searches again in a fraction of a second.
+## 1. Merge folders with exact copies
 
-## Fast comparison
+Built an album by copying from a dump folder? Duplikill finds pictures that exist in two folders **byte-identical
+or with the same picture data**, even if only one copy carries tags (for a JPEG the image data is compared, not
+the metadata).
+Each folder pair gets one question:
+
+- `Enter`: keep them in the album, remove the copies from the other folder, all at once. `T` turns it round,
+  `B` = best-of folder (keep both), `Esc` = later.
+- **Tags survive:** if the copy that goes has more metadata (XMP/IPTC, sidecars), it takes the untagged one's place.
+  Duplikill never rewrites the metadata inside your pictures.
+
+## 2. Compare similar shots
 
 ![Review](assets/review.svg)
 
-- **The whole group fits on one screen**, edge to edge.
-- **Synchronous zoom:** the mouse wheel zooms every image of the group into the same spot (e.g. the eyes of a
-  portrait). From 100 % on, the originals are shown **pixel for pixel**, so you can see blur and noise.
-- **Blink:** hold the right mouse button and every image shows its neighbour at the same zoom and spot.
-- **BEST** blinks on the sharpest full-size image. `KEEP BEST` crosses out all the others.
-- **Click = cross, Del = remove crossed and go to the next group.** The skull removes a single image at once.
-  `Ctrl+Z` brings back the last group.
+- **The whole group on one screen**, edge to edge.
+- **Synchronous zoom:** the mouse wheel zooms every image into the same spot; from 100 % pixel for pixel from the
+  original, so blur and noise show.
+- **Blink:** hold the right mouse button and every image shows its neighbour at the same spot.
+- **BEST** marks the sharpest full-size image; `KEEP BEST` crosses out the rest.
+- **Click = cross, `Del` = remove and next group.** The **skull** removes one image at once.
 
-## Removing is safe
+## Fast
 
-- By default files are **moved**, not deleted, into one bin per drive: `<drive>:\Duplikill-Bin\<original path>`
-  (instant, no copying; XMP sidecars go along). It is a normal folder: look at it in Explorer, delete it when you are
-  sure. Windows' recycle bin and permanent delete can be chosen in the settings, but the recycle bin has a size limit
-  (beyond it Windows deletes for good) and none on network drives.
-- **Get single images back:** `B` opens the BIN view, all removed images as thumbnails, newest first. Click the ones
-  you want and press `R`: they go back to where they were, also days later. `Ctrl+Z` undoes the last delete.
-- At least one image of every group always stays. Nothing is removed without your click.
+- **Scan: [Czkawka](https://github.com/qarmin/czkawka)** by Rafał Mikrut ([@qarmin](https://github.com/qarmin)),
+  the Rust engine behind Krokiet: about 80 new photos/s (4,108 photos: 53 s), seen ones from its cache in seconds.
+- **Verification:** every pair is checked for structure, colour and date; a group holds only if every image matches
+  every other one. 2,400 photos in 400 groups: 0.14 s.
+- **Results are saved:** reopen a folder and groups, crosses and position are back at once.
+- **Similarity slider** in the overview: searches again in a fraction of a second.
 
-## Merge folders with exact copies
+## Safe
 
-Sorted an album out of a big dump folder by copying? Then hundreds of pictures exist twice, and clicking through
-them one by one makes no sense. After a scan Duplikill checks for **exact copies** across two folders: the same
-picture data, even if only one of them carries tags (for a JPEG the compressed image is compared, not the metadata).
-From 5 shared copies it offers one question per folder pair:
-
-- `Enter` keeps them in the suggested folder (the one made mostly of copies, i.e. the album) and removes the copies
-  from the other one, all in one step. `T` turns it round, `B` treats the folder as best-of, `Esc` asks later.
-- **Tags are not lost:** if the copy that goes has more metadata (XMP/IPTC, sidecars), it takes the place of the
-  untagged one instead. Duplikill never rewrites metadata inside your pictures.
-- `Ctrl+Z` undoes the whole merge at once.
-
-## Best-of folders and exclusions
-
-Do you collect your favourites as copies in a "best of" folder? Duplikill notices folders whose images mostly exist
-elsewhere and asks once: exclude it (those duplicates are on purpose) or keep scanning it. Excluded folders can also
-be managed in the settings (`S`).
+- Files are **moved**, not deleted, to `<drive>:\Duplikill-Bin\<original path>` (instant, XMP sidecars along).
+  Recycle bin or permanent delete can be chosen in the settings.
+- `Ctrl+Z` undoes the last step (a whole merge too). `B` shows everything removed; pick images, `R` puts them back,
+  also days later.
+- One image of every group always stays. Nothing goes without your click.
 
 ## Controls
 
 | Input | Action |
 |---|---|
-| Click image | cross / uncross |
-| `Del` / `Backspace` | remove crossed, next group |
+| Click image · `Del` | cross · remove crossed, next group |
 | Skull on an image | remove just this image now |
 | `KEEP BEST` / `ONLY` | cross out all but the best / all but this one |
-| Mouse wheel · `0` | synchronous zoom at the cursor · fit |
-| Middle drag · hold right | pan · blink compare (swappable in settings) |
+| Wheel · `0` · middle drag | synchronous zoom · fit · pan |
+| Hold right · `Tab` | blink compare · one image alone |
 | `Space` `→` / `←` | next / previous group |
-| `Tab` | one image alone, again = next one |
-| `Ctrl+Z` | undo |
-| `Esc` | one step back |
-| `S` · `F1` · `F11` | settings · help · fullscreen |
-| `B` | bin: see removed images, restore single ones (`R`) |
-| `U` | install an update (shown when GitHub has a newer version) |
-| `F8` | report a bug |
+| `Ctrl+Z` · `Esc` | undo · one step back |
+| `S` · `F1` · `F11` · `B` | settings · help · fullscreen · bin |
+| `U` · `F8` | install update · report a bug |
+
+Excluded folders and best-of folders: settings (`S`).
 
 ## Privacy
 
-Duplikill sends nothing by itself. At startup it asks GitHub whether there is a newer release. `F8` (bug report) and
-"share numbers" in the settings open a prefilled GitHub issue in your browser with folder paths removed. You read it
-and decide whether to submit it. Statistics (images removed, space freed) stay on your computer.
+Nothing is sent by itself. At start Duplikill asks GitHub for a newer release. `F8` and "share numbers" open a
+prefilled GitHub issue (paths removed) that you read and submit yourself.
 
 ## Build from source
 
@@ -102,6 +85,5 @@ python -m venv .venv
 
 ## Credits & license
 
-- [Czkawka / Krokiet](https://github.com/qarmin/czkawka) by Rafał Mikrut (MIT): the scan engine.
-- Pixel font: [c64font](https://github.com/zeiche/c64font) (CC0).
-- Duplikill: [MIT License](LICENSE).
+[Czkawka / Krokiet](https://github.com/qarmin/czkawka) by Rafał Mikrut (MIT) · pixel font
+[c64font](https://github.com/zeiche/c64font) (CC0) · Duplikill: [MIT](LICENSE)

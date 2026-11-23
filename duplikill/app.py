@@ -680,28 +680,27 @@ class SettingsScreen(PixelScreen):
 class HelpScreen(PixelScreen):
     """F1 help: the core keys first in double size, then the full reference in white/grey."""
     COLS = 52
-    N_LINES = 30                            # core lines count twice
+    LINE = 1.5                              # line pitch in glyph heights (the font is 8x8 without gaps)
+    TEXT = QColor(200, 200, 200)            # descriptions: lighter than GREY, still below the white keys
 
     CORE = [                                # max 26 characters: drawn at double size
-        "CLICK IMAGE: CROSS IT",
-        "DEL / BACKSPACE: DELETE",
-        "   ALL CROSSED, NEXT GROUP",
-        "SPACE / DOWN: NEXT GROUP",
-        "UP: PREVIOUS GROUP",
+        ("CLICK", "CROSS AN IMAGE"),
+        ("DEL", "DELETE CROSSED"),
+        ("SKULL", "DELETE IT NOW"),
+        ("SPACE / UP", "NEXT / PREVIOUS"),
+        ("CTRL+Z", "UNDO"),
     ]
     ITEMS = [
-        ("", WHITE),
         ("REVIEW (IMAGE COMPARE)", WHITE),
-        ("RIGHT / PAGE DOWN    ", "NEXT GROUP (LIKE SPACE)"),
-        ("LEFT / PAGE UP       ", "PREVIOUS GROUP (LIKE UP)"),
-        ("SKULL ON AN IMAGE    ", "REMOVE THIS ONE IMAGE AT ONCE"),
+        ("DEL / BACKSPACE      ", "DELETE CROSSED, OPEN NEXT GROUP"),
+        ("SKULL (TOP LEFT)     ", "DELETE THIS ONE IMAGE AT ONCE"),
+        ("RIGHT / LEFT         ", "NEXT / PREVIOUS GROUP"),
         ("ONLY / KEEP BEST     ", "CROSS OUT ALL OTHER IMAGES"),
         ("MOUSE WHEEL / 0      ", "ZOOM ALL AT CURSOR / FIT"),
         ("MIDDLE / RIGHT MOUSE ", "DRAG = PAN, HOLD = BLINK"),
         ("TAB / SIDE BUTTONS   ", "ONE IMAGE ALONE / NEXT ONE"),
         ("CTRL+Z               ", "UNDO LAST DELETE"),
         ("ESC                  ", "BACK TO THE OVERVIEW"),
-        ("", WHITE),
         ("OVERVIEW & GENERAL", WHITE),
         ("CLICK GROUP / ENTER  ", "OPEN GROUP"),
         ("STRICT <###..> LOOSE ", "SIMILARITY, SEARCHES AT ONCE"),
@@ -709,12 +708,12 @@ class HelpScreen(PixelScreen):
         ("B                    ", "BIN: SEE + RESTORE REMOVED ONES"),
         ("U / F8               ", "INSTALL UPDATE / REPORT A BUG"),
         ("ESC (2X ON START)    ", "ONE STEP BACK (QUIT ON START)"),
-        ("", WHITE),
-        ("F1 / ESC / CLICK: BACK", WHITE),
     ]
+    CORE_KEY = 11                           # key column of the big block, in big characters (11 + 15 = COLS / 2)
 
     def lines(self) -> list[str]:
-        out = [l.ljust(self.COLS) for l in self.CORE]
+        out = [f"DUPLIKILL V{__version__}".ljust(self.COLS)]
+        out += [(k.ljust(self.CORE_KEY) + d).ljust(self.COLS) for k, d in self.CORE]
         for item in self.ITEMS:
             if isinstance(item[1], QColor):
                 out.append(item[0].ljust(self.COLS))
@@ -722,30 +721,49 @@ class HelpScreen(PixelScreen):
                 out.append((item[0] + item[1])[:self.COLS].ljust(self.COLS))
         return out
 
+    def _rows(self) -> list[tuple]:
+        """(kind, data, height in glyph units): title, big core lines, gaps, section heads and key lines."""
+        rows = [("title", None, 1.0), ("gap", None, 1.5)]
+        rows += [("core", c, 2 * self.LINE) for c in self.CORE]
+        for item in self.ITEMS:
+            if isinstance(item[1], QColor):
+                rows += [("gap", None, 1.5), ("head", item[0], self.LINE * 1.2)]
+            else:
+                rows.append(("item", item, self.LINE))
+        rows += [("gap", None, 1.5), ("foot", None, 1.0)]
+        return rows
+
     def paintEvent(self, e):
         qp = QPainter(self)
         self._paint_bg(qp)
-        ts = max(1, int(0.85 * min(self.width() / (self.COLS * 8), self.height() / (self.N_LINES * 8))))
-        lh = 8 * ts
-        w = self.COLS * lh
-        h = (2 * len(self.CORE) + len(self.ITEMS)) * lh
+        rows = self._rows()
+        units = sum(r[2] for r in rows)
+        ts = max(1, int(0.9 * min(self.width() / (self.COLS * 8), self.height() / (units * 8))))
+        g = 8 * ts                                              # one glyph in pixels
+        w = self.COLS * g
         x0 = (self.width() - w) // 2
-        y0 = (self.height() - h) // 2 + self._fly_offset()
-        for idx, text in enumerate(self.CORE):              # the core: double size, white
-            qp.drawImage(QPoint(x0, y0 + idx * 2 * lh), pixelfont.render([text], 2 * ts, WHITE))
-        y1 = y0 + 2 * len(self.CORE) * lh
-        for idx, item in enumerate(self.ITEMS):
-            y = y1 + idx * lh
-            if isinstance(item[1], QColor):
-                text, col = item
-                if text.strip():
-                    qp.drawImage(QPoint(x0, y), pixelfont.render([text.ljust(self.COLS)], ts, col))
-            else:
-                k_txt, desc = item
+        y = int((self.height() - units * g) // 2 + self._fly_offset())
+        for kind, data, hu in rows:
+            if kind == "title":
+                ver = f"DUPLIKILL V{__version__}"
+                qp.drawImage(QPoint(x0, y), pixelfont.render([ver], ts, WHITE))
+                hint = "F1 / ESC / CLICK: BACK"
+                qp.drawImage(QPoint(x0 + w - len(hint) * g, y), pixelfont.render([hint], ts, GREY))
+            elif kind == "core":                                # the core: double size, key white, text light
+                k, d = data
+                qp.drawImage(QPoint(x0, y), pixelfont.render([k], 2 * ts, WHITE))
+                qp.drawImage(QPoint(x0 + self.CORE_KEY * 2 * g, y), pixelfont.render([d], 2 * ts, self.TEXT))
+            elif kind == "head":
+                qp.drawImage(QPoint(x0, y), pixelfont.render([data], ts, WHITE))
+                qp.fillRect(x0, y + g + ts, len(data) * g, ts, GREY)    # thin underline
+            elif kind == "item":
+                k_txt, desc = data
                 qp.drawImage(QPoint(x0, y), pixelfont.render([k_txt], ts, WHITE))
-                qp.drawImage(QPoint(x0 + len(k_txt) * lh, y),
-                             pixelfont.render([desc[:self.COLS - len(k_txt)].ljust(self.COLS - len(k_txt))], ts, GREY))
-        self._draw_cursor(qp, x0, y0 + h, ts)
+                qp.drawImage(QPoint(x0 + len(k_txt) * g, y),
+                             pixelfont.render([desc[:self.COLS - len(k_txt)]], ts, self.TEXT))
+            elif kind == "foot":
+                self._draw_cursor(qp, x0, y, ts)
+            y += int(round(hu * g))
 
 
 class Main(QMainWindow):

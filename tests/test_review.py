@@ -225,6 +225,8 @@ def test_help_screen_f1(app):
     h.resize(1600, 950)
     h._t_in = 0.0
     pm = h.grab()
-    assert not pm.isNull() and len(h.lines()) == len(h.CORE) + len(h.ITEMS)
-    assert all(len(c) <= h.COLS // 2 for c in h.CORE)        # double size must fit
+    assert not pm.isNull() and len(h.lines()) == 1 + len(h.CORE) + len(h.ITEMS)    # version line on top
+    assert h.lines()[0].startswith("DUPLIKILL V")
+    assert any(k == "SKULL" for k, _ in h.CORE)
+    assert all(len(k) < h.CORE_KEY and h.CORE_KEY + len(d) <= h.COLS // 2 for k, d in h.CORE)  # double size fits
     assert all(len(line) == h.COLS for line in h.lines())
