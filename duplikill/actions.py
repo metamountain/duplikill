@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 
 from .index import data_dir
@@ -43,16 +44,60 @@ def target_for(path: str, target_root: str, mode: str = "", scan_root: str = "")
     return os.path.join(target_root, drive.rstrip(":\\/") or "root", rest.lstrip("\\/"))
 
 
+def _move_retry(src: str, dst: str, tries: int = 3) -> bool:
+    """shutil.move with short retries for files another program has open for a moment."""
+    for i in range(tries):
+        try:
+            shutil.move(src, dst)
+            return True
+        except OSError:
+            if os.path.exists(src) and os.path.exists(dst):   # copied across drives, delete failed: undo copy
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+            if not os.path.exists(src):
+                return os.path.exists(dst)
+            time.sleep(0.2 * (i + 1))
+    return False
+
+
 class Mover:
     def __init__(self, target_root: str = "", mode: str = "", scan_root: str = ""):
         self.target_root, self.mode, self.scan_root = target_root, mode, scan_root
         self.journal = os.path.join(data_dir(), "journal.jsonl")
 
     def move(self, paths: list[str], group_key: str) -> list[tuple[str, str]]:
+        moved, total_bytes = self._to_bin(paths)
+        self._log({"at": time.time(), "group": group_key, "moved": moved, "bytes": total_bytes})
+        return moved
+
+    def merge(self, remove: list[str], renames: list[tuple[str, str]], key: str) -> tuple[list, list]:
+        """Folder merge as ONE undo step: copies into the bin, then tagged copies take the freed places."""
+        from .copies import rename_with_sidecars
+        moved, total_bytes = self._to_bin(remove)
+        renamed = []
+        try:
+            for src, dst in renames:
+                try:
+                    renamed += rename_with_sidecars(src, dst)
+                except OSError as ex:            # its place is still taken (that removal failed): leave it
+                    print("merge: skipped", src, ex, file=sys.stderr)
+        finally:
+            self._log({"at": time.time(), "group": key, "moved": moved, "bytes": total_bytes, "renamed": renamed})
+        return moved, renamed
+
+    def _log(self, entry: dict) -> None:
+        with open(self.journal, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _to_bin(self, paths: list[str]) -> tuple[list[tuple[str, str]], int]:
+        """Moves what it can; a file that stays locked (viewer, virus scanner) is skipped with its sidecars,
+        so the journal always lists exactly what was moved."""
         moved = []
         total_bytes = 0
         for p in paths:
-            for src in [p, *sidecars(p)]:
+            for n, src in enumerate([p, *sidecars(p)]):
                 dst = target_for(src, self.target_root, self.mode, self.scan_root)
                 if os.path.exists(dst):
                     base, ext = os.path.splitext(dst)
@@ -63,34 +108,37 @@ class Mover:
                         dst = f"{base}_{stamp}_{k}{ext}"
                         k += 1
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.move(src, dst)
+                if not _move_retry(src, dst):
+                    print("move: skipped (locked?)", src, file=sys.stderr)
+                    if n == 0:
+                        break                    # the image stays, so its sidecars stay too
+                    continue
                 moved.append((src, dst))
                 try:
                     total_bytes += os.path.getsize(dst)
                 except OSError:
                     pass
-        with open(self.journal, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"at": time.time(), "group": group_key, "moved": moved, "bytes": total_bytes},
-                                ensure_ascii=False) + "\n")
-        return moved
+        return moved, total_bytes
 
-    def undo_last(self) -> dict | None:
-        """Moves the last batch back; returns the journal entry or None."""
+    def undo_last(self, key: str | None = None) -> dict | None:
+        """Moves the last batch (or the last one with this group key) back; returns the journal entry or None."""
         if not os.path.exists(self.journal):
             return None
         with open(self.journal, encoding="utf-8") as fh:
-            lines = fh.readlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if not lines:
+            lines = [line for line in fh.readlines() if line.strip()]
+        idx = len(lines) - 1
+        if key is not None:
+            while idx >= 0 and json.loads(lines[idx]).get("group") != key:
+                idx -= 1
+        if idx < 0:
             return None
-        entry = json.loads(lines[-1])
-        for src, dst in reversed(entry["moved"]):
+        entry = json.loads(lines[idx])
+        for src, dst in [*reversed(entry.get("renamed", [])), *reversed(entry["moved"])]:
             if os.path.exists(dst) and not os.path.exists(src):
                 os.makedirs(os.path.dirname(src), exist_ok=True)
                 shutil.move(dst, src)
         with open(self.journal, "w", encoding="utf-8") as fh:
-            fh.writelines(lines[:-1])
+            fh.writelines(lines[:idx] + lines[idx + 1:])
         return entry
 
     def _entries(self) -> list[dict]:

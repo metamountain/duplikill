@@ -46,6 +46,19 @@ Windows 10/11, 64-bit, no Python needed.
   you want and press `R`: they go back to where they were, also days later. `Ctrl+Z` undoes the last delete.
 - At least one image of every group always stays. Nothing is removed without your click.
 
+## Merge folders with exact copies
+
+Sorted an album out of a big dump folder by copying? Then hundreds of pictures exist twice, and clicking through
+them one by one makes no sense. After a scan Duplikill checks for **exact copies** across two folders: the same
+picture data, even if only one of them carries tags (for a JPEG the compressed image is compared, not the metadata).
+From 5 shared copies it offers one question per folder pair:
+
+- `Enter` keeps them in the suggested folder (the one made mostly of copies, i.e. the album) and removes the copies
+  from the other one, all in one step. `T` turns it round, `B` treats the folder as best-of, `Esc` asks later.
+- **Tags are not lost:** if the copy that goes has more metadata (XMP/IPTC, sidecars), it takes the place of the
+  untagged one instead. Duplikill never rewrites metadata inside your pictures.
+- `Ctrl+Z` undoes the whole merge at once.
+
 ## Best-of folders and exclusions
 
 Do you collect your favourites as copies in a "best of" folder? Duplikill notices folders whose images mostly exist

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QStackedWi
 from . import __version__, czkawka, pixelfont, report, session, verify
 from .actions import Mover
 from .binview import BinView
-from .index import data_dir, human
+from .index import Photo, data_dir, human
 from .nebula import Nebula
 from .review import AT_END, PER_GROUP, Review
 from .thumbs import Thumbs
@@ -327,6 +327,15 @@ class SearchJob(QThread):
         self.paths: list[str] | None = None
         self.saved: dict | None = None           # session.load() result to check against the folder
         self.fp: dict | None = None
+        self.copies: list | None = None          # folder pairs with exact copies (full scans only)
+
+    def _find_copies(self, groups):
+        from . import copies
+        try:
+            self.copies = copies.find(groups, self.paths or [], stop=self.stop)
+        except Exception as ex:                  # a merge offer is a bonus, never a reason to fail the scan
+            print("copies:", ex, file=sys.stderr)
+            self.copies = []
 
     def run(self):
         try:
@@ -337,6 +346,7 @@ class SearchJob(QThread):
                     raise czkawka.Cancelled()
                 self.fp = session.fingerprint(paths)
                 if self.saved is not None and self.saved.get("fingerprint") == self.fp:
+                    self._find_copies(self.saved["groups"])
                     self.restored.emit(self.saved)           # same images as last time: groups as saved
                     return
                 n = len(paths)
@@ -368,6 +378,8 @@ class SearchJob(QThread):
                 self.counted.emit(n, eta)
             candidates = czkawka.search(self.root, self.options, self.stop)
             groups = verify.refine(candidates, self.sigs, self.stop)          # drop look-alikes
+            if self.confirm and not self.stop.is_set():
+                self._find_copies(groups)
             if self.stop.is_set():
                 raise czkawka.Cancelled()
             self.done.emit(groups)
@@ -457,6 +469,47 @@ class BestOfScreen(PixelScreen):
     def mousePressEvent(self, e):
         line = self.line_at(e)
         answer = {7: "exclude", 8: "keep", 9: "later"}.get(line)
+        if answer and e.button() == Qt.LeftButton:
+            self.answered.emit(answer)
+
+
+def _short(folder: str, w: int = 30) -> str:
+    return pixelfont.plain(os.path.basename(folder.rstrip("\\/")) or folder).upper()[:w]
+
+
+class MergeScreen(PixelScreen):
+    """After a scan: 'these two folders share N exact copies - merge them?' (one key instead of N groups)."""
+    answered = Signal(str)            # "merge" | "flip" | "bestof" | "later"
+
+    def __init__(self):
+        super().__init__()
+        self.m, self.pos, self.total = None, 0, 0
+        self._keys: dict[int, str] = {}
+
+    def ask(self, m, pos: int, total: int):
+        self.m, self.pos, self.total = m, pos, total
+        self.update()
+
+    def lines(self):
+        m = self.m
+        if m is None:
+            return []
+        k, o = _short(m.keep), _short(m.other)
+        w = max(len(k), len(o))
+        out = ["EXACT COPIES - MERGE?", "", f"{m.count} PICTURES ARE IN BOTH FOLDERS:", "",
+               f"{k.ljust(w)}  {m.count} OF {m.n_keep}", f"{o.ljust(w)}  {m.count} OF {m.n_other}", ""]
+        if m.swaps:
+            out += [f"{m.swaps} COPIES IN {o} HAVE MORE TAGS:", f"THEY MOVE INTO {k}, TAGS STAY.", ""]
+        first = len(out)
+        out += [f"ENTER: KEEP THEM IN {k}", f"       REMOVE {m.count} COPIES FROM {o}",
+                f"T: THE OTHER WAY ROUND", "B: BEST-OF, KEEP BOTH (EXCLUDE FOLDER)", "ESC: DECIDE LATER"]
+        self._keys = {first: "merge", first + 1: "merge", first + 2: "flip", first + 3: "bestof", first + 4: "later"}
+        if self.total > 1:
+            out += ["", f"({self.pos + 1} OF {self.total})"]
+        return out
+
+    def mousePressEvent(self, e):
+        answer = self._keys.get(self.line_at(e))
         if answer and e.button() == Qt.LeftButton:
             self.answered.emit(answer)
 
@@ -725,6 +778,11 @@ class Main(QMainWindow):
         self.bestof_screen.answered.connect(self._bestof_answer)
         self._bestof: list[tuple[str, int, int]] = []
         self._bestof_excluded = False
+        self.merge_screen = MergeScreen()
+        self.merge_screen.answered.connect(self._merge_answer)
+        self._merges: list = []
+        self._merge_n = 0
+        self._rescan_after = False               # merged or excluded something: search the folder again
         self.help_screen = HelpScreen()
         self.help_screen.clicked.connect(self.close_help)
         self.stack.addWidget(self.start)
@@ -732,6 +790,7 @@ class Main(QMainWindow):
         self.stack.addWidget(self.settings_screen)
         self.stack.addWidget(self.help_screen)
         self.stack.addWidget(self.bestof_screen)
+        self.stack.addWidget(self.merge_screen)
         self.bin_view = BinView(self.thumbs, Mover())
         self.bin_view.back.connect(self.close_bin)
         self.bin_view.restored.connect(self._restored)
@@ -1094,6 +1153,11 @@ class Main(QMainWindow):
                 n = self._digit(e)
                 if 0 <= n < len(subs):
                     self._answer(("x", n) if e.modifiers() & Qt.ShiftModifier else n)
+        elif cur is self.merge_screen:
+            answer = {Qt.Key_Return: "merge", Qt.Key_Enter: "merge", Qt.Key_T: "flip", Qt.Key_B: "bestof",
+                      Qt.Key_Escape: "later"}.get(k)
+            if answer:
+                self._merge_answer(answer)
         elif cur is self.bestof_screen:
             if k == Qt.Key_X:
                 self._bestof_answer("exclude")
@@ -1279,14 +1343,16 @@ class Main(QMainWindow):
         self.settings_screen.update()
 
     def _found(self, groups, saved: dict | None = None):
-        if saved is None and getattr(self, "groups", None) is not None and self.review is not None:
+        if saved is None and getattr(self, "groups", None) is not None and self.review is not None \
+                and not getattr(self, "_skip_save", False):
             self.save_session()                         # slider: keep the old strictness's crosses
         self.slider.busy = False
         if saved is not None:
             self._fp = saved["fingerprint"]
         elif self.job is not None and self.job.fp is not None:
             self._fp = self.job.fp
-        self.history.clear()
+        # group steps point at the old groups; folder merges of this folder stay undoable across rescans
+        self.history = [h for h in self.history if h[0] is None and h[2][2] == self.root]
         for w in (self.nebula, self.review):
             if w is not None:
                 self.stack.removeWidget(w)
@@ -1316,16 +1382,94 @@ class Main(QMainWindow):
                 report.save_stats(st)
             except OSError:
                 pass
-        if paths:                                       # a full scan (not the slider): look for best-of folders
+        self._skip_save = False
+        job = self.job
+        full = job is not None and job.confirm and job.paths is not None and (saved is None or job.saved is saved)
+        if full:                                        # a full scan or reopen (not the slider)
             from . import bestof
             s = self.settings
-            self._bestof = bestof.candidates(groups, paths, s.get("excluded", []) + s.get("bestof_kept", []))
+            self._merges = list(job.copies or [])
+            self._merge_n, self._rescan_after = len(self._merges), False
+            in_merge = [f for m in self._merges for f in (m.keep, m.other)]   # asked about already
+            self._bestof = [b for b in bestof.candidates(groups, job.paths, s.get("excluded", []) +
+                                                         s.get("bestof_kept", []) + in_merge)]
             self._bestof_n, self._bestof_excluded = len(self._bestof), False
-            if self._bestof:
-                self.bestof_screen.ask(self._bestof[0], 0, self._bestof_n)
-                self.stack.setCurrentWidget(self.bestof_screen)
+            self._next_question()
+
+    def _next_question(self):
+        """Merge offers first, then best-of folders, then the overview (rescan if something changed)."""
+        if self._merges:
+            self.merge_screen.ask(self._merges[0], self._merge_n - len(self._merges), self._merge_n)
+            self.stack.setCurrentWidget(self.merge_screen)
+        elif self._bestof:
+            self.bestof_screen.ask(self._bestof[0], self._bestof_n - len(self._bestof), self._bestof_n)
+            self.stack.setCurrentWidget(self.bestof_screen)
+        else:
+            self.overview()
+            if self._rescan_after or self._bestof_excluded:   # same folder again (cache: quick)
+                self._rescan_after = self._bestof_excluded = False
+                self._skip_save = True                          # the old groups are out of date
+                session.forget(self.root, int(self.settings["max_diff"]), int(self.settings["hash_size"]))
+                self.run_search(self.root, quiet=True)
+
+    def _merge_answer(self, answer: str):
+        if not self._merges:
+            return
+        if answer == "flip":
+            self._merges[0] = self._merges[0].flipped()
+            self.merge_screen.ask(self._merges[0], self.merge_screen.pos, self._merge_n)
+            return
+        m = self._merges.pop(0)
+        if answer == "later":
+            self._merges = []
+        elif answer == "bestof":
+            self.exclude(m.album)
+            self._rescan_after = True
+        elif answer == "merge" and self.do_merge(m):
+            self._rescan_after = True
+        self._next_question()
+
+    def do_merge(self, m) -> bool:
+        """One step for the whole folder pair; Ctrl+Z brings everything back (MOVE mode)."""
+        from .copies import rename_with_sidecars
+        remove, renames = m.plan()
+        if not remove or not self._confirm_delete(len(remove)):
+            return False
+        key = f"merge:{time.time():.3f}"
+        if self.dry_run:
+            print("WOULD MERGE:", m.other, "->", m.keep, "remove", len(remove), "rename", len(renames))
+            return False
+        known = {p.path: p for g in self.groups for p in g.photos}
+        gone = []
+        for p in remove:
+            ph = known.get(p)
+            if ph is None:
+                try:
+                    st = os.stat(p)
+                    ph = Photo(path=p, size=st.st_size, mtime=st.st_mtime)
+                except OSError:
+                    continue
+            gone.append(ph)
+        action = self.settings["action"]
+        if action == "move":
+            moved, _ = self._mover().merge(remove, renames, key)
+        else:
+            moved = self._act(remove, key)
+            for src, dst in renames:
+                try:
+                    rename_with_sidecars(src, dst)
+                except OSError as ex:
+                    print("merge: skipped", src, ex, file=sys.stderr)
+        done = {os.path.normcase(s) for s, _ in moved}
+        gone = [p for p in gone if os.path.normcase(p.path) in done]
+        self._fp_change(gone, -1)
+        self._count(gone, action, False)
+        self.history.append((None, moved, (key, gone, self.root), action))
+        return True
 
     def _bestof_answer(self, answer: str):
+        if not self._bestof:
+            return
         folder = self._bestof.pop(0)[0]
         if answer == "exclude":
             self.exclude(folder)
@@ -1333,13 +1477,9 @@ class Main(QMainWindow):
         elif answer == "keep":
             self.settings.setdefault("bestof_kept", []).append(folder)
             save_settings(self.settings)
-        if answer != "later" and self._bestof:
-            self.bestof_screen.ask(self._bestof[0], self._bestof_n - len(self._bestof), self._bestof_n)
-            return
-        self._bestof = []
-        self.overview()
-        if self._bestof_excluded:                       # same folder again without them (cache: quick)
-            self.run_search(self.root, quiet=True)
+        elif answer == "later":
+            self._bestof = []
+        self._next_question()
 
     # ------------------------------------------------------------ review
     def overview(self):
@@ -1475,6 +1615,15 @@ class Main(QMainWindow):
         if self.history[-1][3] != "move" and not self.dry_run:
             return                                  # recycle bin / deleted: nothing to bring back here
         i, moved, single, action = self.history.pop()
+        if i is None:                               # a folder merge: everything back, then search again
+            key, gone, _ = single
+            self._mover().undo_last(key)
+            self._fp_change(gone, +1)
+            self._count(gone, action, False, -1)
+            self._skip_save = True
+            session.forget(self.root, int(self.settings["max_diff"]), int(self.settings["hash_size"]))
+            self.run_search(self.root, quiet=True)
+            return
         if not self.dry_run:
             self._mover().undo_last()
         g = self.groups[i]
