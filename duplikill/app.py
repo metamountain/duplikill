@@ -376,8 +376,11 @@ class SearchJob(QThread):
                     if self.stop.is_set():
                         raise czkawka.Cancelled()
                 self.counted.emit(n, eta)
+            if self.paths is None:
+                self.paths = czkawka.list_images(self.root, self.options.excluded, self.stop)
             candidates = czkawka.search(self.root, self.options, self.stop)
-            groups = verify.refine(candidates, self.sigs, self.stop)          # drop look-alikes
+            groups = verify.refine(candidates, self.sigs, self.stop, paths=self.paths,
+                                   max_diff=self.options.max_diff)  # drop look-alikes + add time series
             if self.confirm and not self.stop.is_set():
                 self._find_copies(groups)
             if self.stop.is_set():

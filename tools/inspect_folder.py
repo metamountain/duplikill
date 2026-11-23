@@ -50,7 +50,7 @@ def inspect_folder(folder: str, max_diff: int | None = None, force_scan: bool = 
     else:
         source = "live-scan"
         candidates = czkawka.search(folder, opts)
-        groups = verify.refine(candidates, verify.SigCache())
+        groups = verify.refine(candidates, verify.SigCache(), paths=paths, max_diff=md)
 
     merges = copies.find(groups, paths, skip=excluded)
     in_merge = [f for m in merges if not m.same_folder for f in (m.keep, m.other)]

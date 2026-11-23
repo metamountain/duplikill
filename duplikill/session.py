@@ -13,7 +13,7 @@ import os
 from .groups import Group
 from .index import Photo, data_dir
 
-VERSION = 1
+VERSION = 3
 
 
 def fingerprint(paths: list[str]) -> dict:
